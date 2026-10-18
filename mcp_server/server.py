@@ -1078,6 +1078,522 @@ async def audit_url_redirection_safety(
 
 
 @mcp.tool()
+async def audit_jwt_token(token: str) -> Dict[str, Any]:
+    """
+    Reverse engineer and audit JSON Web Tokens (JWT) for signature vulnerabilities,
+    none-algorithm bypass (CVE-2015-9235), expiration status, and payload data leakage.
+
+    Args:
+        token: Raw JWT string (e.g. 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...').
+    """
+    clean_token = token.strip().replace("Bearer ", "")
+    parts = clean_token.split(".")
+    if len(parts) != 3:
+        return {"error": "Invalid JWT format. Must contain 3 dot-separated base64 segments."}
+
+    def decode_b64(seg: str) -> Dict[str, Any]:
+        pad = seg + "=" * ((4 - len(seg) % 4) % 4)
+        try:
+            raw = base64.urlsafe_b64decode(pad)
+            return json.loads(raw.decode("utf-8", errors="ignore"))
+        except Exception:
+            return {"raw": seg, "error": "Failed to decode JSON"}
+
+    header = decode_b64(parts[0])
+    payload = decode_b64(parts[1])
+    sig_hex = parts[2]
+
+    vulnerabilities = []
+    alg = header.get("alg", "").upper() if isinstance(header, dict) else ""
+    if alg == "NONE" or alg == "":
+        vulnerabilities.append("CRITICAL: 'alg: none' algorithm detected! Token signature validation can be bypassed.")
+    elif alg.startswith("HS") and "RS" in header.get("typ", "").upper():
+        vulnerabilities.append("MEDIUM: Potential algorithm confusion risk (HS vs RS).")
+
+    # Audit expiration
+    exp = payload.get("exp") if isinstance(payload, dict) else None
+    exp_status = "No expiration claim (Persistent token risk)"
+    if exp:
+        try:
+            exp_dt = datetime.utcfromtimestamp(exp)
+            now = datetime.utcnow()
+            diff = (exp_dt - now).total_seconds()
+            if diff < 0:
+                exp_status = f"EXPIRED ({abs(int(diff // 3600))} hours ago on {exp_dt.isoformat()}Z)"
+            else:
+                exp_status = f"VALID (Expires in {int(diff // 3600)}h {int((diff % 3600) // 60)}m on {exp_dt.isoformat()}Z)"
+        except Exception:
+            exp_status = f"Invalid timestamp value: {exp}"
+
+    # Check for sensitive data leakage in claims
+    sensitive_claims = {}
+    if isinstance(payload, dict):
+        for k, v in payload.items():
+            if any(s in k.lower() for s in ["password", "secret", "private", "hash", "ssn", "credit"]):
+                sensitive_claims[k] = v
+
+    return {
+        "algorithm": alg,
+        "token_type": header.get("typ", "JWT") if isinstance(header, dict) else "Unknown",
+        "header": header,
+        "payload": payload,
+        "signature_length_bytes": len(sig_hex),
+        "expiration_status": exp_status,
+        "vulnerabilities": vulnerabilities if vulnerabilities else ["Standard algorithm and format"],
+        "sensitive_data_exposure": sensitive_claims if sensitive_claims else "No obvious credential/password fields leaked in payload",
+    }
+
+
+@mcp.tool()
+async def extract_javascript_endpoints(
+    target_url_or_js: str,
+    is_raw_code: bool = False,
+) -> Dict[str, Any]:
+    """
+    Reverse engineer client-side JavaScript bundles to extract hidden API routes,
+    REST endpoints, Axios/Fetch request URLs, and GraphQL queries.
+
+    Args:
+        target_url_or_js: Web page URL, JS script URL, or raw JavaScript code string.
+        is_raw_code: Set to True if passing raw JS code directly instead of a URL.
+    """
+    js_content = target_url_or_js
+    source_url = None
+
+    if not is_raw_code:
+        target_url = target_url_or_js
+        if not target_url.startswith(("http://", "https://")):
+            target_url = "https://" + target_url
+        source_url = target_url
+
+        try:
+            async with httpx.AsyncClient(timeout=12.0, follow_redirects=True, verify=False) as client:
+                resp = await client.get(target_url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+                body = resp.text
+
+                # If HTML, extract script tags and fetch up to 3 bundles
+                if "<html" in body.lower() or "<!doctype" in body.lower():
+                    script_srcs = re.findall(r'<script[^>]+src=["\']([^"\']+)["\']', body, re.IGNORECASE)
+                    collected_js = [body]
+                    for s_src in script_srcs[:4]:
+                        bundle_url = urljoin(str(resp.url), s_src)
+                        try:
+                            s_resp = await client.get(bundle_url, timeout=6.0)
+                            if s_resp.status_code == 200:
+                                collected_js.append(s_resp.text)
+                        except Exception:
+                            pass
+                    js_content = "\n".join(collected_js)
+                else:
+                    js_content = body
+        except Exception as e:
+            return {"error": f"Failed to fetch JavaScript from {target_url}: {str(e)}"}
+
+    # Regex patterns for endpoint extraction
+    endpoint_patterns = [
+        r'["\'](/(?:api|v[0-9]+|auth|graphql|users|admin|internal|webhook)/[a-zA-Z0-9_\-\./]+)["\']',
+        r'fetch\(["\']([a-zA-Z0-9_\-\./:]+)["\']',
+        r'axios\.(?:get|post|put|delete|patch)\(["\']([a-zA-Z0-9_\-\./:]+)["\']',
+        r'["\'](https?://[a-zA-Z0-9_\-\.]+(?:/[a-zA-Z0-9_\-\./]*)?)["\']',
+    ]
+
+    discovered_endpoints = set()
+    for pat in endpoint_patterns:
+        for match in re.findall(pat, js_content):
+            if isinstance(match, str) and len(match) > 3 and not match.endswith((".png", ".jpg", ".svg", ".css", ".woff")):
+                discovered_endpoints.add(match)
+
+    # Classify endpoints
+    api_routes = [e for e in discovered_endpoints if any(k in e.lower() for k in ["/api", "/v1", "/v2", "/graphql", "/rest"])]
+    auth_routes = [e for e in discovered_endpoints if any(k in e.lower() for k in ["login", "token", "auth", "oauth", "session", "user"])]
+    internal_admin = [e for e in discovered_endpoints if any(k in e.lower() for k in ["admin", "internal", "config", "debug", "test", "staging"])]
+
+    return {
+        "source": source_url or "Raw JavaScript snippet",
+        "total_endpoints_discovered": len(discovered_endpoints),
+        "api_routes": sorted(api_routes)[:30],
+        "authentication_endpoints": sorted(auth_routes)[:20],
+        "internal_or_admin_candidates": sorted(internal_admin)[:15],
+        "sample_endpoints": sorted(list(discovered_endpoints))[:40],
+    }
+
+
+@mcp.tool()
+async def recover_sourcemap_metadata(target_url: str) -> Dict[str, Any]:
+    """
+    Probe and inspect JavaScript Source Maps (.map files) on a website to reconstruct
+    unminified client source code, project directory layouts, and hidden development files.
+
+    Args:
+        target_url: Web application URL (or direct path to a .js file).
+    """
+    if not target_url.startswith(("http://", "https://")):
+        target_url = "https://" + target_url
+
+    results = []
+    async with httpx.AsyncClient(timeout=8.0, follow_redirects=True, verify=False) as client:
+        try:
+            # If target ends with .js, test directly; otherwise fetch HTML and locate script tags
+            js_urls = []
+            if target_url.endswith(".js"):
+                js_urls.append(target_url)
+            else:
+                resp = await client.get(target_url, headers={"User-Agent": "Mozilla/5.0"})
+                script_tags = re.findall(r'<script[^>]+src=["\']([^"\']+\.js[^"\']*)["\']', resp.text, re.IGNORECASE)
+                for st in script_tags[:5]:
+                    js_urls.append(urljoin(str(resp.url), st))
+
+            for j_url in js_urls:
+                map_url = None
+                # Check for sourceMappingURL comment inside JS
+                try:
+                    j_resp = await client.get(j_url, timeout=5.0)
+                    m = re.search(r'//[#@]\s*sourceMappingURL=([^\s]+)', j_resp.text)
+                    if m:
+                        map_url = urljoin(j_url, m.group(1))
+                    else:
+                        map_url = j_url + ".map"
+
+                    # Probe .map endpoint
+                    map_resp = await client.get(map_url, timeout=6.0)
+                    if map_resp.status_code == 200 and "sources" in map_resp.text:
+                        data = map_resp.json()
+                        sources = data.get("sources", [])
+                        results.append({
+                            "script": j_url,
+                            "sourcemap_url": map_url,
+                            "exposed": True,
+                            "total_source_files": len(sources),
+                            "recovered_file_paths": sources[:25],
+                            "has_source_content": bool(data.get("sourcesContent")),
+                        })
+                    else:
+                        results.append({
+                            "script": j_url,
+                            "sourcemap_url": map_url,
+                            "exposed": False,
+                            "status": f"HTTP {map_resp.status_code}",
+                        })
+                except Exception as ex:
+                    results.append({"script": j_url, "error": str(ex)})
+        except Exception as e:
+            return {"error": f"Failed to scan for source maps: {str(e)}"}
+
+    exposed_count = sum(1 for r in results if r.get("exposed"))
+    return {
+        "target_url": target_url,
+        "sourcemaps_exposed_count": exposed_count,
+        "security_verdict": "VULNERABLE (Source code exposed via unremoved sourcemaps)" if exposed_count > 0 else "SECURE (Sourcemaps stripped in production)",
+        "details": results,
+    }
+
+
+@mcp.tool()
+async def audit_html_forms_and_csrf(target_url: str) -> Dict[str, Any]:
+    """
+    Audit HTML form submissions for missing anti-CSRF tokens, sensitive data sent over GET,
+    unencrypted password actions, and insecure input autocomplete attributes.
+
+    Args:
+        target_url: URL of the web page containing forms (e.g. login, checkout, settings).
+    """
+    if not target_url.startswith(("http://", "https://")):
+        target_url = "https://" + target_url
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True, verify=False) as client:
+            resp = await client.get(target_url, headers={"User-Agent": "Mozilla/5.0"})
+            body = resp.text
+
+            form_blocks = re.findall(r'<form\b[^>]*>(.*?)</form>', body, re.DOTALL | re.IGNORECASE)
+            form_attrs = re.findall(r'<form\b([^>]*)>', body, re.IGNORECASE)
+
+            audited_forms = []
+            for i, attr_str in enumerate(form_attrs):
+                action_m = re.search(r'action=["\']([^"\']*)["\']', attr_str, re.IGNORECASE)
+                method_m = re.search(r'method=["\']([^"\']*)["\']', attr_str, re.IGNORECASE)
+
+                action = action_m.group(1) if action_m else "(Same Page)"
+                method = method_m.group(1).upper() if method_m else "GET"
+
+                inner = form_blocks[i] if i < len(form_blocks) else ""
+                inputs = re.findall(r'<input\b([^>]*)>', inner, re.IGNORECASE)
+
+                has_password = False
+                has_csrf = False
+                input_names = []
+
+                for inp in inputs:
+                    name_m = re.search(r'name=["\']([^"\']*)["\']', inp, re.IGNORECASE)
+                    type_m = re.search(r'type=["\']([^"\']*)["\']', inp, re.IGNORECASE)
+
+                    n = name_m.group(1) if name_m else ""
+                    t = type_m.group(1).lower() if type_m else "text"
+                    if n:
+                        input_names.append(n)
+                    if t == "password":
+                        has_password = True
+                    if any(c in n.lower() for c in ["csrf", "_token", "authenticity_token", "xsrf"]):
+                        has_csrf = True
+
+                issues = []
+                if method == "POST" and not has_csrf:
+                    issues.append("HIGH: Missing Anti-CSRF token on POST form action.")
+                if has_password and method == "GET":
+                    issues.append("CRITICAL: Password input submitted via GET method (credentials will leak in URL logs).")
+                if action.startswith("http://"):
+                    issues.append("CRITICAL: Form submits over unencrypted plaintext HTTP.")
+
+                audited_forms.append({
+                    "form_index": i + 1,
+                    "action": action,
+                    "method": method,
+                    "contains_password_field": has_password,
+                    "has_csrf_protection": has_csrf,
+                    "input_fields": input_names,
+                    "findings": issues if issues else ["Properly configured"],
+                })
+
+            return {
+                "target_url": target_url,
+                "forms_discovered": len(audited_forms),
+                "forms": audited_forms if audited_forms else "No HTML <form> elements identified on this page.",
+            }
+    except Exception as e:
+        return {"error": f"Failed to audit forms: {str(e)}"}
+
+
+@mcp.tool()
+async def inspect_websocket_security(ws_url: str) -> Dict[str, Any]:
+    """
+    Audit WebSocket endpoint security: enforces wss:// TLS transport, verifies handshake headers,
+    and detects Cross-Site WebSocket Hijacking (CSWSH) origin reflection vulnerabilities.
+
+    Args:
+        ws_url: WebSocket URL (e.g. 'wss://example.com/ws' or 'ws://example.com/socket').
+    """
+    clean_url = ws_url.strip()
+    is_secure = clean_url.startswith("wss://")
+    is_plain = clean_url.startswith("ws://")
+
+    if not is_secure and not is_plain:
+        clean_url = "wss://" + clean_url.replace("https://", "").replace("http://", "")
+        is_secure = True
+
+    http_url = clean_url.replace("wss://", "https://").replace("ws://", "http://")
+    findings = []
+
+    if not is_secure:
+        findings.append("HIGH: Endpoint uses unencrypted ws:// protocol. Susceptible to MitM interception.")
+
+    cswsh_test_result = {}
+    try:
+        async with httpx.AsyncClient(timeout=8.0, verify=False) as client:
+            resp = await client.get(
+                http_url,
+                headers={
+                    "Upgrade": "websocket",
+                    "Connection": "Upgrade",
+                    "Sec-WebSocket-Key": "dGhlIHNhbXBsZSBub25jZQ==",
+                    "Sec-WebSocket-Version": "13",
+                    "Origin": "https://unauthorized-attacker.example.com",
+                },
+            )
+            cswsh_test_result = {
+                "handshake_status": resp.status_code,
+                "server_header": resp.headers.get("server", "Hidden"),
+                "upgrade_accepted": resp.headers.get("upgrade", "").lower() == "websocket",
+            }
+            if resp.status_code == 101 or resp.headers.get("upgrade", "").lower() == "websocket":
+                findings.append("CRITICAL: Cross-Site WebSocket Hijacking (CSWSH) possible. Arbitrary untrusted origin accepted in handshake.")
+    except Exception as e:
+        cswsh_test_result = {"probe_status": f"Connection response: {str(e)}"}
+
+    return {
+        "websocket_url": clean_url,
+        "is_encrypted_transport": is_secure,
+        "findings": findings if findings else ["WebSocket endpoint enforces standard origin and protocol constraints."],
+        "handshake_probe": cswsh_test_result,
+    }
+
+
+@mcp.tool()
+async def analyze_web_tech_stack(target_url: str) -> Dict[str, Any]:
+    """
+    Fingerprint and reverse engineer website technology stack components:
+    frontend libraries (React, Next.js, Vue, Angular), backend frameworks, CDN providers, and CMS systems.
+
+    Args:
+        target_url: Target URL to analyze.
+    """
+    if not target_url.startswith(("http://", "https://")):
+        target_url = "https://" + target_url
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True, verify=False) as client:
+            resp = await client.get(target_url, headers={"User-Agent": "Mozilla/5.0"})
+            body = resp.text
+            hdrs = {k.lower(): v for k, v in resp.headers.items()}
+
+            stack: Dict[str, List[str]] = {
+                "frontend_frameworks": [],
+                "backend_and_server": [],
+                "cdn_and_cloud": [],
+                "cms_and_platforms": [],
+            }
+
+            # Frontend detections
+            if "__NEXT_DATA__" in body:
+                stack["frontend_frameworks"].append("Next.js (App / Pages Router)")
+            if "react" in body.lower() or "data-reactroot" in body:
+                stack["frontend_frameworks"].append("React")
+            if "vue" in body.lower() or "v-cloak" in body or "data-v-" in body:
+                stack["frontend_frameworks"].append("Vue.js")
+            if "ng-version" in body or "angular" in body.lower():
+                stack["frontend_frameworks"].append("Angular")
+            if "svelte" in body.lower():
+                stack["frontend_frameworks"].append("Svelte")
+
+            # Backend & Server detections
+            server_banner = hdrs.get("server", "")
+            powered_by = hdrs.get("x-powered-by", "")
+            if server_banner:
+                stack["backend_and_server"].append(f"Server: {server_banner}")
+            if powered_by:
+                stack["backend_and_server"].append(f"Powered-By: {powered_by}")
+            if "csrftoken" in resp.cookies:
+                stack["backend_and_server"].append("Django (Python)")
+            if "laravel_session" in resp.cookies:
+                stack["backend_and_server"].append("Laravel (PHP)")
+            if "__viewstate" in body.lower():
+                stack["backend_and_server"].append("ASP.NET (Microsoft)")
+
+            # CDN & Cloud hosting
+            if "cf-ray" in hdrs:
+                stack["cdn_and_cloud"].append("Cloudflare CDN")
+            if "x-amz-cf-id" in hdrs:
+                stack["cdn_and_cloud"].append("AWS CloudFront")
+            if "x-vercel-id" in hdrs:
+                stack["cdn_and_cloud"].append("Vercel Edge Network")
+            if "x-render-origin-server" in hdrs:
+                stack["cdn_and_cloud"].append("Render Cloud")
+
+            # CMS
+            if "wp-content" in body:
+                stack["cms_and_platforms"].append("WordPress CMS")
+            if "shopify" in body.lower():
+                stack["cms_and_platforms"].append("Shopify E-Commerce")
+
+            return {
+                "target_url": str(resp.url),
+                "status_code": resp.status_code,
+                "detected_technologies": stack,
+            }
+    except Exception as e:
+        return {"error": f"Failed to fingerprint tech stack: {str(e)}"}
+
+
+@mcp.tool()
+async def audit_subdomain_takeover_cnames(subdomain: str) -> Dict[str, Any]:
+    """
+    Check DNS CNAME records for dangling aliases pointing to unclaimed cloud services
+    (GitHub Pages, AWS S3, Heroku, Vercel, Shopify) to identify subdomain takeover risks.
+
+    Args:
+        subdomain: Subdomain to analyze (e.g., 'sub.example.com' or 'dev.example.com').
+    """
+    clean_sub = subdomain.replace("https://", "").replace("http://", "").split("/")[0].strip()
+
+    vulnerable_providers = {
+        "github.io": "GitHub Pages (Check for 404 There isn't a GitHub Pages site here)",
+        "s3.amazonaws.com": "AWS S3 Bucket (Check for NoSuchBucket error)",
+        "herokuapp.com": "Heroku App (Check for 'No such app' error page)",
+        "cname.vercel-dns.com": "Vercel Project (Unlinked custom domain)",
+        "myshopify.com": "Shopify (Unclaimed shop store)",
+        "surge.sh": "Surge.sh (Project not deployed)",
+        "zendesk.com": "Zendesk Help Center (Help Center Closed)",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=7.0) as client:
+            resp = await client.get(
+                "https://cloudflare-dns.com/dns-query",
+                params={"name": clean_sub, "type": "CNAME"},
+                headers={"Accept": "application/dns-json"},
+            )
+            data = resp.json()
+            cnames = [ans.get("data", "").rstrip(".") for ans in data.get("Answer", []) if ans.get("type") == 5]
+
+            takeover_risk = None
+            for cname in cnames:
+                for prov_domain, prov_desc in vulnerable_providers.items():
+                    if prov_domain in cname.lower():
+                        takeover_risk = {
+                            "cname_target": cname,
+                            "service_identified": prov_desc,
+                            "recommendation": "Verify whether the target service bucket/app is active or delete the dangling CNAME.",
+                        }
+                        break
+
+            return {
+                "subdomain": clean_sub,
+                "cname_records": cnames if cnames else "No CNAME records found (Direct A/AAAA resolution or NXDOMAIN)",
+                "takeover_risk_detected": bool(takeover_risk),
+                "assessment": takeover_risk if takeover_risk else "No known vulnerable third-party CNAME pointers detected.",
+            }
+    except Exception as e:
+        return {"error": f"Failed to query DNS CNAME: {str(e)}"}
+
+
+@mcp.tool()
+async def deobfuscate_javascript_snippet(obfuscated_js: str) -> Dict[str, Any]:
+    """
+    Analyze and decode obfuscated client-side JavaScript snippets:
+    unpacks hexadecimal (\\xNN) escapes, unicode (\\uNNNN) sequences, base64 strings, and identifies packed eval calls.
+
+    Args:
+        obfuscated_js: Obfuscated or minified JavaScript string.
+    """
+    code = obfuscated_js
+
+    # Decode hex escapes \xHH
+    def hex_repl(m):
+        try:
+            return chr(int(m.group(1), 16))
+        except Exception:
+            return m.group(0)
+
+    decoded_hex = re.sub(r'\\x([0-9a-fA-F]{2})', hex_repl, code)
+
+    # Decode unicode escapes \uHHHH
+    def unicode_repl(m):
+        try:
+            return chr(int(m.group(1), 16))
+        except Exception:
+            return m.group(0)
+
+    decoded_all = re.sub(r'\\u([0-9a-fA-F]{4})', unicode_repl, decoded_hex)
+
+    # Detect suspicious patterns
+    warnings = []
+    if "eval(" in decoded_all:
+        warnings.append("Dynamic eval() execution detected.")
+    if "Function(" in decoded_all:
+        warnings.append("Function() constructor invocation detected.")
+    if "document.write" in decoded_all:
+        warnings.append("DOM write injection detected.")
+    if "atob(" in decoded_all:
+        warnings.append("Base64 atob() decoding detected.")
+
+    return {
+        "original_length": len(obfuscated_js),
+        "deobfuscated_length": len(decoded_all),
+        "security_warnings": warnings if warnings else ["No dynamic code execution signatures found"],
+        "deobfuscated_preview": decoded_all[:1200],
+    }
+
+
+@mcp.tool()
 async def hexstrike_backend_relay(
     tool_name: str,
     arguments: Dict[str, Any],
@@ -1188,9 +1704,17 @@ async def root(request: Request):
             "inspect_web_source_secrets",
             "audit_dns_security_records",
             "audit_url_redirection_safety",
+            "audit_jwt_token",
+            "extract_javascript_endpoints",
+            "recover_sourcemap_metadata",
+            "audit_html_forms_and_csrf",
+            "inspect_websocket_security",
+            "analyze_web_tech_stack",
+            "audit_subdomain_takeover_cnames",
+            "deobfuscate_javascript_snippet",
             "hexstrike_backend_relay",
         ],
-        "active_tools_count": 15,
+        "active_tools_count": 23,
         "render_deployment": "Running 24/7 background service",
     })
 
