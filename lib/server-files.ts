@@ -655,6 +655,116 @@ async def audit_oauth_oidc_endpoints(issuer_url: str) -> Dict[str, Any]:
         return {"error": str(e)}
 
 @mcp.tool()
+async def audit_ssrf_url_validation(url_string: str) -> Dict[str, Any]:
+    """Audit URLs and webhook parameters for SSRF, loopback, private RFC1918 IPs, and cloud metadata."""
+    parsed = urlparse(url_string.strip())
+    h = parsed.hostname or ""
+    violations = []
+    if parsed.scheme not in ["http", "https"]:
+        violations.append(f"Dangerous/non-http scheme: {parsed.scheme}")
+    if h.lower() in ["localhost", "127.0.0.1", "0.0.0.0", "::1"] or "169.254" in h:
+        violations.append(f"Private/metadata host: {h}")
+    try:
+        for ip in [a[4][0] for a in socket.getaddrinfo(h, None)]:
+            ip_obj = ipaddress.ip_address(ip)
+            if ip_obj.is_private or ip_obj.is_loopback or str(ip_obj) == "169.254.169.254":
+                violations.append(f"Resolves to private/loopback IP: {ip}")
+    except Exception:
+        pass
+    return {"url": url_string, "safe_for_outbound": len(violations) == 0, "violations": violations}
+
+@mcp.tool()
+async def inspect_tls_cipher_suites(target_host: str, port: int = 443) -> Dict[str, Any]:
+    """Inspect negotiated TLS version, cipher suite, and PFS forward secrecy support."""
+    host = target_host.replace("https://", "").replace("http://", "").split("/")[0].split(":")[0]
+    try:
+        ctx = ssl.create_default_context()
+        with socket.create_connection((host, port), timeout=6.0) as s:
+            with ctx.wrap_socket(s, server_hostname=host) as ssock:
+                return {"target": host, "tls_version": ssock.version(), "cipher": ssock.cipher(), "alpn": ssock.selected_alpn_protocol()}
+    except Exception as e:
+        return {"error": str(e)}
+
+@mcp.tool()
+async def audit_cors_preflight_and_origin_reflection(target_url: str, custom_origin: Optional[str] = None) -> Dict[str, Any]:
+    """Test CORS preflight for dynamic reflection of arbitrary origins and credentials exposure."""
+    origin = custom_origin or "https://evil-attacker.com"
+    url = target_url if target_url.startswith(("http://", "https://")) else "https://" + target_url
+    try:
+        async with httpx.AsyncClient(timeout=6.0) as c:
+            r = await c.options(url, headers={"Origin": origin, "Access-Control-Request-Method": "POST"})
+            ao = r.headers.get("access-control-allow-origin")
+            ac = r.headers.get("access-control-allow-credentials", "").lower() == "true"
+            return {"target": url, "allow_origin": ao, "allow_credentials": ac, "critical_reflection": ao == origin and ac}
+    except Exception as e:
+        return {"error": str(e)}
+
+@mcp.tool()
+async def audit_server_side_template_injection_syntax(template_snippet: str) -> Dict[str, Any]:
+    """Audit input for SSTI syntax markers (Jinja2, SpEL, Freemarker, Ruby ERB) and RCE chains."""
+    has_jinja = bool(re.search(r"\{\{.*\}\}", template_snippet))
+    has_spel = "T(java.lang" in template_snippet or "#{" in template_snippet
+    has_rce = any(w in template_snippet for w in ["__class__", "__mro__", "Runtime", "ProcessBuilder", "Execute"])
+    return {"snippet_len": len(template_snippet), "has_template_delimiters": has_jinja or has_spel, "rce_chain_detected": has_rce}
+
+@mcp.tool()
+async def inspect_email_security_dmarc_spf_dkim(domain: str) -> Dict[str, Any]:
+    """Query and audit SPF and DMARC DNS TXT records to evaluate domain email spoofing risk."""
+    d = domain.replace("https://", "").replace("http://", "").split("/")[0]
+    spf, dmarc = None, None
+    async with httpx.AsyncClient(timeout=6.0) as c:
+        try:
+            r = await c.get("https://cloudflare-dns.com/dns-query", params={"name": d, "type": "TXT"}, headers={"Accept": "application/dns-json"})
+            for a in r.json().get("Answer", []):
+                val = a.get("data", "").strip('"')
+                if val.startswith("v=spf1"):
+                    spf = val
+            r2 = await c.get("https://cloudflare-dns.com/dns-query", params={"name": f"_dmarc.{d}", "type": "TXT"}, headers={"Accept": "application/dns-json"})
+            for a in r2.json().get("Answer", []):
+                val = a.get("data", "").strip('"')
+                if val.startswith("v=DMARC1"):
+                    dmarc = val
+        except Exception:
+            pass
+    return {"domain": d, "spf_record": spf, "dmarc_record": dmarc, "spoofing_vulnerable": spf is None or "+all" in (spf or "") or dmarc is None}
+
+@mcp.tool()
+async def audit_file_upload_validation_filters(filename: str, declared_content_type: str = "image/jpeg") -> Dict[str, Any]:
+    """Audit upload filenames for path traversal, executable double extensions, and null bytes."""
+    bad_exts = ["php", "phtml", "jsp", "asp", "aspx", "exe", "sh", "cer"]
+    parts = filename.lower().split(".")
+    ext = parts[-1] if len(parts) > 1 else ""
+    has_traversal = ".." in filename or "/" in filename or "\\" in filename
+    is_exec = ext in bad_exts
+    has_double_ext = len(parts) > 2 and any(p in bad_exts for p in parts[1:-1])
+    return {"filename": filename, "is_executable": is_exec, "double_extension_trick": has_double_ext, "path_traversal": has_traversal, "safe": not (is_exec or has_double_ext or has_traversal)}
+
+@mcp.tool()
+async def inspect_http2_http3_support(target_url: str) -> Dict[str, Any]:
+    """Inspect ALPN negotiation for HTTP/2 and Alt-Svc headers for HTTP/3 QUIC support."""
+    url = target_url if target_url.startswith(("http://", "https://")) else "https://" + target_url
+    host = urlparse(url).hostname or ""
+    h2 = False
+    try:
+        ctx = ssl.create_default_context()
+        ctx.set_alpn_protocols(["h2", "http/1.1"])
+        with socket.create_connection((host, 443), timeout=5.0) as s:
+            with ctx.wrap_socket(s, server_hostname=host) as ssock:
+                h2 = ssock.selected_alpn_protocol() == "h2"
+    except Exception:
+        pass
+    return {"target": url, "supports_http2": h2}
+
+@mcp.tool()
+async def audit_open_redirect_patterns(test_url: str) -> Dict[str, Any]:
+    """Audit URL/parameter against open redirect bypasses (protocol-relative //, backslash, @-sign)."""
+    clean = test_url.strip()
+    is_relative = clean.startswith("//") and not clean.startswith("///")
+    has_backslash = clean.startswith("/\\") or clean.startswith("\\/")
+    has_at_sign = "@" in clean and clean.startswith("http")
+    return {"input": test_url, "is_open_redirect": is_relative or has_backslash or has_at_sign, "pattern": "Protocol-relative" if is_relative else ("Backslash" if has_backslash else ("At-Sign" if has_at_sign else "None"))}
+
+@mcp.tool()
 async def hexstrike_backend_relay(tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Relay to HexStrike core engine (https://github.com/0x4m4/hexstrike-ai) with fallback simulation."""
     try:
@@ -705,7 +815,7 @@ async def root(request: Request):
         "service": "HexStrike AI FastMCP Server",
         "sse_endpoint": "/sse",
         "health": "/health",
-        "tools_active": 31,
+        "tools_active": 39,
         "tools": [
             "inspect_binary_headers",
             "disassemble_machine_code",
@@ -737,6 +847,14 @@ async def root(request: Request):
             "audit_rate_limiting_headers",
             "inspect_ip_address_reputation_and_asn",
             "audit_oauth_oidc_endpoints",
+            "audit_ssrf_url_validation",
+            "inspect_tls_cipher_suites",
+            "audit_cors_preflight_and_origin_reflection",
+            "audit_server_side_template_injection_syntax",
+            "inspect_email_security_dmarc_spf_dkim",
+            "audit_file_upload_validation_filters",
+            "inspect_http2_http3_support",
+            "audit_open_redirect_patterns",
             "hexstrike_backend_relay"
         ],
     })

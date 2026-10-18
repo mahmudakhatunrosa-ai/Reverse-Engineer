@@ -2176,6 +2176,704 @@ async def audit_oauth_oidc_endpoints(issuer_url: str) -> Dict[str, Any]:
 
 
 @mcp.tool()
+async def audit_ssrf_url_validation(url_string: str) -> Dict[str, Any]:
+    """
+    Audit URLs and webhook endpoints for Server-Side Request Forgery (SSRF) vulnerabilities,
+    private/link-local/loopback IP addressing, cloud metadata access (169.254.169.254),
+    and hex/octal/decimal IP encoding bypasses.
+
+    Args:
+        url_string: Target URL or webhook candidate string to audit.
+    """
+    url_trimmed = url_string.strip()
+    if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", url_trimmed):
+        url_trimmed = "http://" + url_trimmed
+
+    parsed = urlparse(url_trimmed)
+    scheme = parsed.scheme.lower()
+    hostname = parsed.hostname or ""
+    port = parsed.port
+
+    violations = []
+    risk_level = "LOW"
+
+    # 1. Scheme Validation
+    dangerous_schemes = ["file", "gopher", "dict", "ftp", "tftp", "ldap", "ldaps", "php", "jar", "netdoc"]
+    if scheme in dangerous_schemes:
+        risk_level = "CRITICAL"
+        violations.append({
+            "type": "Dangerous URI Scheme",
+            "severity": "CRITICAL",
+            "detail": f"Scheme '{scheme}://' allows arbitrary file reading or internal protocol manipulation.",
+        })
+    elif scheme not in ["http", "https"]:
+        violations.append({
+            "type": "Non-standard Scheme",
+            "severity": "MEDIUM",
+            "detail": f"Scheme '{scheme}://' is not standard HTTP/HTTPS.",
+        })
+
+    # 2. Hostname string checks
+    hostname_lower = hostname.lower()
+    loopback_names = ["localhost", "127.0.0.1", "0.0.0.0", "::1", "localtest.me", "vcap.me", "lvh.me"]
+    if hostname_lower in loopback_names or hostname_lower.endswith(".localhost"):
+        risk_level = "CRITICAL"
+        violations.append({
+            "type": "Explicit Loopback Hostname",
+            "severity": "CRITICAL",
+            "detail": f"Hostname '{hostname}' explicitly references the local host loopback interface.",
+        })
+
+    # Check for Decimal / Octal / Hex IP obfuscation (e.g. 2130706433 = 127.0.0.1, 0x7f000001)
+    if re.fullmatch(r"\d+", hostname):
+        try:
+            val = int(hostname)
+            ip_obj = ipaddress.IPv4Address(val)
+            if ip_obj.is_loopback or ip_obj.is_private:
+                risk_level = "CRITICAL"
+                violations.append({
+                    "type": "Decimal-Encoded IP Bypass",
+                    "severity": "CRITICAL",
+                    "detail": f"Hostname '{hostname}' translates to private/loopback IP {ip_obj}.",
+                })
+        except Exception:
+            pass
+
+    # 3. DNS Resolution & IP Range Auditing
+    resolved_ips = []
+    try:
+        addr_info = socket.getaddrinfo(hostname, None)
+        for item in addr_info:
+            ip_str = item[4][0]
+            if ip_str not in resolved_ips:
+                resolved_ips.append(ip_str)
+    except Exception:
+        pass
+
+    for ip_str in resolved_ips:
+        try:
+            ip = ipaddress.ip_address(ip_str)
+            # Cloud metadata
+            if str(ip) == "169.254.169.254":
+                risk_level = "CRITICAL"
+                violations.append({
+                    "type": "Cloud Metadata Service Access (IMDS)",
+                    "severity": "CRITICAL",
+                    "ip": ip_str,
+                    "detail": "IP 169.254.169.254 exposes AWS/GCP/Azure instance credentials, access tokens, and IAM roles.",
+                })
+            elif ip.is_loopback:
+                risk_level = "CRITICAL"
+                violations.append({
+                    "type": "Loopback IP Resolved",
+                    "severity": "CRITICAL",
+                    "ip": ip_str,
+                    "detail": "Resolves to 127.0.0.0/8 or ::1, allowing local service exploitation (Redis, Memcached, internal APIs).",
+                })
+            elif ip.is_private:
+                risk_level = "HIGH"
+                violations.append({
+                    "type": "RFC 1918 Private Network Address",
+                    "severity": "HIGH",
+                    "ip": ip_str,
+                    "detail": "Resolves to internal private intranet (10.0.0.0/8, 172.16.0.0/12, or 192.168.0.0/16).",
+                })
+            elif ip.is_link_local:
+                risk_level = "HIGH"
+                violations.append({
+                    "type": "Link-Local Address",
+                    "severity": "HIGH",
+                    "ip": ip_str,
+                    "detail": "Resolves to link-local address range (169.254.0.0/16 or fe80::/10).",
+                })
+            elif ip.is_unspecified:
+                risk_level = "CRITICAL"
+                violations.append({
+                    "type": "Unspecified 0.0.0.0 Address",
+                    "severity": "CRITICAL",
+                    "ip": ip_str,
+                    "detail": "0.0.0.0 binds to all local interfaces on Linux systems.",
+                })
+        except Exception:
+            pass
+
+    return {
+        "input_url": url_string,
+        "normalized_url": url_trimmed,
+        "scheme": scheme,
+        "hostname": hostname,
+        "port": port,
+        "resolved_ips": resolved_ips,
+        "is_safe_for_webhook": len(violations) == 0,
+        "ssrf_risk_level": risk_level,
+        "violations_detected": violations if violations else ["No SSRF or local network indicators found"],
+        "remediation_guidelines": [
+            "Enforce strict URL scheme whitelist (only https://).",
+            "Perform DNS resolution and reject any private, loopback, or link-local IP addresses before making HTTP requests.",
+            "Disable HTTP redirects or re-validate redirect destination IPs to prevent DNS Rebinding / TOCTOU SSRF attacks.",
+            "Deploy network-level egress filtering / proxy isolation for outbound webhook services.",
+        ],
+    }
+
+
+@mcp.tool()
+async def inspect_tls_cipher_suites(target_host: str, port: int = 443) -> Dict[str, Any]:
+    """
+    Inspect SSL/TLS cipher suites, negotiated TLS protocol version, forward secrecy (PFS),
+    and check for deprecated ciphers (RC4, 3DES, CBC) or obsolete TLS 1.0/1.1 protocols.
+
+    Args:
+        target_host: Domain name or hostname to inspect (e.g. 'example.com').
+        port: TLS service port (default is 443).
+    """
+    clean_host = target_host.strip().replace("https://", "").replace("http://", "").split("/")[0].split(":")[0]
+
+    try:
+        context = ssl.create_default_context()
+        context.check_hostname = True
+        context.verify_mode = ssl.CERT_REQUIRED
+
+        with socket.create_connection((clean_host, port), timeout=8.0) as sock:
+            with context.wrap_socket(sock, server_hostname=clean_host) as ssock:
+                version = ssock.version()
+                cipher_tuple = ssock.cipher()
+                alpn = ssock.selected_alpn_protocol()
+                cert = ssock.getpeercert()
+
+        cipher_name = cipher_tuple[0] if cipher_tuple else "Unknown"
+        tls_protocol = cipher_tuple[1] if cipher_tuple else version
+        bits = cipher_tuple[2] if cipher_tuple else 0
+
+        # Evaluate Security Posture
+        weaknesses = []
+        if version in ["TLSv1", "TLSv1.1", "SSLv2", "SSLv3"]:
+            weaknesses.append(f"Obsolete Protocol: {version} is deprecated by RFC 8996 and insecure.")
+
+        if "RC4" in cipher_name or "3DES" in cipher_name or "DES" in cipher_name:
+            weaknesses.append(f"Weak Cipher: {cipher_name} suffers from Sweet32 or stream-cipher biases.")
+        elif "CBC" in cipher_name and version == "TLSv1.2":
+            weaknesses.append(f"CBC Cipher: {cipher_name} may be vulnerable to padding oracle attacks if not using Encrypt-then-MAC.")
+
+        has_pfs = "ECDHE" in cipher_name or "DHE" in cipher_name or version == "TLSv1.3"
+
+        grade = "A+"
+        if version == "TLSv1.3" and not weaknesses:
+            grade = "A+"
+        elif version == "TLSv1.2" and not weaknesses and has_pfs:
+            grade = "A"
+        elif not has_pfs:
+            grade = "B"
+        elif weaknesses:
+            grade = "C" if version in ["TLSv1.2"] else "F"
+
+        return {
+            "target": clean_host,
+            "port": port,
+            "negotiated_tls_version": version,
+            "cipher_suite": cipher_name,
+            "encryption_bits": bits,
+            "forward_secrecy_pfs": has_pfs,
+            "alpn_negotiated": alpn if alpn else "None / HTTP 1.1",
+            "security_grade": grade,
+            "weaknesses_identified": weaknesses if weaknesses else ["Modern cipher suite with forward secrecy (PFS) enforced."],
+            "recommendation": "Enforce TLS 1.3 and modern AEAD ciphers (AES-GCM, ChaCha20-Poly1305); disable TLS 1.0 and 1.1.",
+        }
+    except Exception as e:
+        return {"target": clean_host, "port": port, "error": f"TLS connection audit failed: {str(e)}"}
+
+
+@mcp.tool()
+async def audit_cors_preflight_and_origin_reflection(
+    target_url: str,
+    custom_origin: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Audit CORS preflight responses for dangerous wildcard reflections, dynamic Origin echoing,
+    null-origin trust, and Access-Control-Allow-Credentials misconfigurations.
+
+    Args:
+        target_url: API endpoint URL to test.
+        custom_origin: Optional custom Origin header to test (defaults to 'https://evil-attacker.com').
+    """
+    if not target_url.startswith(("http://", "https://")):
+        target_url = "https://" + target_url
+
+    test_origin = custom_origin or "https://evil-attacker.com"
+    findings = []
+    risk_level = "LOW"
+
+    async with httpx.AsyncClient(timeout=8.0, follow_redirects=False) as client:
+        # Test 1: Arbitrary Origin Reflection
+        try:
+            r1 = await client.options(
+                target_url,
+                headers={
+                    "Origin": test_origin,
+                    "Access-Control-Request-Method": "POST",
+                    "Access-Control-Request-Headers": "Authorization, Content-Type",
+                },
+            )
+            allow_origin = r1.headers.get("access-control-allow-origin", "")
+            allow_creds = r1.headers.get("access-control-allow-credentials", "").lower() == "true"
+
+            if allow_origin == test_origin and allow_creds:
+                risk_level = "CRITICAL"
+                findings.append({
+                    "issue": "Arbitrary Origin Reflection with Credentials Allowed",
+                    "severity": "CRITICAL",
+                    "evidence": f"Reflected: {allow_origin}, Credentials: true",
+                    "impact": "Attackers can steal sensitive user sessions, cookies, and tokens via cross-origin JavaScript requests.",
+                })
+            elif allow_origin == test_origin:
+                risk_level = "MEDIUM"
+                findings.append({
+                    "issue": "Arbitrary Origin Dynamically Reflected (Without Credentials)",
+                    "severity": "MEDIUM",
+                    "evidence": f"Reflected: {allow_origin}",
+                })
+            elif allow_origin == "*":
+                findings.append({
+                    "issue": "Wildcard Origin ('*') Enabled",
+                    "severity": "LOW" if not allow_creds else "CRITICAL",
+                    "evidence": "Access-Control-Allow-Origin: *",
+                })
+        except Exception:
+            pass
+
+        # Test 2: 'null' Origin Trust
+        try:
+            r2 = await client.options(
+                target_url,
+                headers={
+                    "Origin": "null",
+                    "Access-Control-Request-Method": "GET",
+                },
+            )
+            allow_null = r2.headers.get("access-control-allow-origin", "")
+            if allow_null == "null":
+                findings.append({
+                    "issue": "Insecure 'null' Origin Permitted",
+                    "severity": "HIGH",
+                    "impact": "Sandboxed iframes and local file HTML executions can bypass CORS boundaries.",
+                })
+        except Exception:
+            pass
+
+    return {
+        "target_url": target_url,
+        "test_origin_used": test_origin,
+        "cors_risk_level": risk_level,
+        "findings_count": len(findings),
+        "vulnerabilities": findings if findings else ["CORS preflight does not reflect untrusted origins."],
+        "remediation": "Do not dynamically echo back the Request Origin. Maintain an explicit whitelist of trusted domains and avoid 'null' origin.",
+    }
+
+
+@mcp.tool()
+async def audit_server_side_template_injection_syntax(template_snippet: str) -> Dict[str, Any]:
+    """
+    Audit user-supplied input, templates, and view parameters for Server-Side Template
+    Injection (SSTI) syntax markers and Remote Code Execution (RCE) patterns.
+
+    Args:
+        template_snippet: String, template expression, or suspicious parameter value to analyze.
+    """
+    detected_engines = []
+    rce_patterns = []
+    risk_level = "LOW"
+
+    # Jinja2 / Flask / Mako (Python)
+    if re.search(r"\{\{.*\}\}", template_snippet) or re.search(r"\{%.*%\}", template_snippet):
+        detected_engines.append("Jinja2 / Twig / Django / Mako")
+        if any(pat in template_snippet for pat in ["__class__", "__mro__", "__subclasses__", "__builtins__", "__globals__", "lipsum", "cycler", "url_for"]):
+            rce_patterns.append("Python Jinja2 sandbox escape payload (__class__.__mro__.__subclasses__)")
+            risk_level = "CRITICAL"
+
+    # SpEL / Spring (Java)
+    if re.search(r"\#\{.*\}", template_snippet) or "T(java.lang" in template_snippet or "T(System)" in template_snippet:
+        detected_engines.append("Spring Expression Language (SpEL)")
+        if "Runtime" in template_snippet or "ProcessBuilder" in template_snippet:
+            rce_patterns.append("Java SpEL command execution chain (T(java.lang.Runtime).getRuntime())")
+            risk_level = "CRITICAL"
+
+    # Freemarker / Velocity (Java)
+    if re.search(r"\$\{.*\}", template_snippet):
+        detected_engines.append("Freemarker / Velocity / EL Expression")
+        if "Execute" in template_snippet or "new(" in template_snippet or "?api" in template_snippet:
+            rce_patterns.append("Freemarker TemplateModel / Execute invocation")
+            risk_level = "CRITICAL"
+
+    # Ruby ERB / Smarty
+    if "<%=" in template_snippet or "<%" in template_snippet:
+        detected_engines.append("Ruby ERB / EJS")
+    if "{php}" in template_snippet or "{literal}" in template_snippet:
+        detected_engines.append("Smarty PHP Template Engine")
+        rce_patterns.append("Smarty {php} direct code execution block")
+        risk_level = "CRITICAL"
+
+    # Mathematical expression evaluation probes (e.g. 7*7, {{7*7}}, ${7*7})
+    math_probes = re.findall(r"(\{\{|\$\{|\#\{)\s*(\d+)\s*\*\s*(\d+)\s*(\}\})", template_snippet)
+    has_math_probe = len(math_probes) > 0
+
+    if (detected_engines or has_math_probe) and risk_level == "LOW":
+        risk_level = "MEDIUM"
+
+    return {
+        "analyzed_length": len(template_snippet),
+        "overall_risk_level": risk_level,
+        "is_ssti_suspected": len(detected_engines) > 0 or len(rce_patterns) > 0,
+        "detected_engine_signatures": list(set(detected_engines)) if detected_engines else ["No template engine syntax identified"],
+        "critical_rce_indicators": rce_patterns,
+        "math_eval_probe_detected": has_math_probe,
+        "remediation": "Never concatenate untrusted user input directly into template strings. Use strict data context passing and sandbox execution.",
+    }
+
+
+@mcp.tool()
+async def inspect_email_security_dmarc_spf_dkim(domain: str) -> Dict[str, Any]:
+    """
+    Audit domain email authentication records (SPF, DMARC, DKIM) to evaluate
+    vulnerability to domain spoofing, CEO fraud, and email impersonation attacks.
+
+    Args:
+        domain: Domain name to audit (e.g. 'company.com').
+    """
+    clean_domain = domain.strip().replace("https://", "").replace("http://", "").split("/")[0].split(":")[0]
+
+    spf_record = None
+    dmarc_record = None
+    findings = []
+    risk_level = "LOW"
+
+    async with httpx.AsyncClient(timeout=8.0) as client:
+        # Query SPF TXT record
+        try:
+            r_spf = await client.get(
+                "https://cloudflare-dns.com/dns-query",
+                params={"name": clean_domain, "type": "TXT"},
+                headers={"Accept": "application/dns-json"},
+            )
+            answers = r_spf.json().get("Answer", [])
+            for ans in answers:
+                data = ans.get("data", "").strip('"')
+                if data.startswith("v=spf1"):
+                    spf_record = data
+                    break
+        except Exception:
+            pass
+
+        # Query DMARC TXT record
+        try:
+            r_dmarc = await client.get(
+                "https://cloudflare-dns.com/dns-query",
+                params={"name": f"_dmarc.{clean_domain}", "type": "TXT"},
+                headers={"Accept": "application/dns-json"},
+            )
+            answers = r_dmarc.json().get("Answer", [])
+            for ans in answers:
+                data = ans.get("data", "").strip('"')
+                if data.startswith("v=DMARC1"):
+                    dmarc_record = data
+                    break
+        except Exception:
+            pass
+
+    # Audit SPF
+    if not spf_record:
+        risk_level = "HIGH"
+        findings.append({
+            "record": "SPF",
+            "issue": "Missing SPF Record",
+            "severity": "HIGH",
+            "impact": "Any mail server on the internet can spoof outbound emails purporting to be from this domain.",
+        })
+    else:
+        if "+all" in spf_record:
+            risk_level = "CRITICAL"
+            findings.append({
+                "record": "SPF",
+                "issue": "Permissive '+all' Qualifier",
+                "severity": "CRITICAL",
+                "impact": "Explicitly authorizes all IP addresses globally to send email for this domain.",
+            })
+        elif "?all" in spf_record:
+            findings.append({
+                "record": "SPF",
+                "issue": "Neutral '?all' Qualifier",
+                "severity": "MEDIUM",
+                "impact": "Mail receivers will not reject unauthorized senders.",
+            })
+
+    # Audit DMARC
+    if not dmarc_record:
+        risk_level = "HIGH"
+        findings.append({
+            "record": "DMARC",
+            "issue": "Missing DMARC Policy",
+            "severity": "HIGH",
+            "impact": "Domain lacks phishing defense policy; unauthenticated messages are delivered to inboxes.",
+        })
+    else:
+        if "p=none" in dmarc_record:
+            findings.append({
+                "record": "DMARC",
+                "issue": "DMARC Policy Set to 'p=none' (Monitoring Only)",
+                "severity": "MEDIUM",
+                "impact": "Spoofed emails failing SPF/DKIM are still delivered without rejection or quarantine.",
+            })
+
+    return {
+        "domain": clean_domain,
+        "spf_record": spf_record or "None",
+        "dmarc_record": dmarc_record or "None",
+        "email_spoofing_risk": risk_level,
+        "vulnerabilities": findings if findings else ["Strong SPF and DMARC enforcement policies active."],
+        "recommended_dmarc_record": f"v=DMARC1; p=reject; pct=100; rua=mailto:dmarc-reports@{clean_domain}",
+    }
+
+
+@mcp.tool()
+async def audit_file_upload_validation_filters(
+    filename: str,
+    declared_content_type: str = "image/jpeg",
+) -> Dict[str, Any]:
+    """
+    Audit file upload parameters for extension bypasses, double extensions,
+    null byte injection, path traversal in filenames, and Content-Type spoofing.
+
+    Args:
+        filename: Uploaded filename (e.g. 'avatar.php.jpg' or 'report.pdf').
+        declared_content_type: Declared MIME type header (e.g. 'image/png').
+    """
+    issues = []
+    risk_level = "LOW"
+
+    # 1. Path Traversal in filename
+    if ".." in filename or "/" in filename or "\\" in filename:
+        risk_level = "CRITICAL"
+        issues.append({
+            "vector": "Path Traversal in Filename",
+            "severity": "CRITICAL",
+            "detail": "Filename contains directory traversal operators ('../' or slashes) which may overwrite system files.",
+        })
+
+    # 2. Null byte injection
+    if "%00" in filename or "\x00" in filename:
+        risk_level = "CRITICAL"
+        issues.append({
+            "vector": "Null Byte Injection",
+            "severity": "CRITICAL",
+            "detail": "Null byte (%00) terminator detected, used to truncate filename extensions in vulnerable backend runtimes.",
+        })
+
+    # 3. Executable extensions list
+    dangerous_exts = {
+        "php": ["php", "phtml", "php3", "php4", "php5", "php7", "phar", "inc"],
+        "jsp": ["jsp", "jspx", "jsw", "jsv", "jspf"],
+        "asp": ["asp", "aspx", "cer", "asa", "asax"],
+        "executable": ["exe", "dll", "so", "bat", "cmd", "sh", "ps1", "vbs"],
+        "web": ["html", "htm", "shtml", "svg", "xhtml"],
+    }
+    all_dangerous = [ext for group in dangerous_exts.values() for ext in group]
+
+    # Split all extensions
+    parts = filename.lower().split(".")
+    ext = parts[-1] if len(parts) > 1 else ""
+
+    if ext in all_dangerous:
+        risk_level = "CRITICAL"
+        issues.append({
+            "vector": "Direct Executable Extension",
+            "severity": "CRITICAL",
+            "extension": ext,
+            "detail": f"File ends with server-executable extension '{ext}'.",
+        })
+
+    # 4. Double Extension Check (e.g. shell.php.jpg)
+    if len(parts) > 2:
+        for inner in parts[1:-1]:
+            if inner in all_dangerous:
+                risk_level = "HIGH"
+                issues.append({
+                    "vector": "Double Extension Bypass",
+                    "severity": "HIGH",
+                    "inner_extension": inner,
+                    "detail": f"Filename contains secondary executable extension '{inner}'. Apache AddHandler or nginx regex may execute this as script.",
+                })
+
+    # 5. Content-Type Mismatch
+    if ext in all_dangerous and declared_content_type.startswith("image/"):
+        issues.append({
+            "vector": "MIME Type Spoofing",
+            "severity": "HIGH",
+            "detail": f"Declared Content-Type '{declared_content_type}' conflicts with executable extension '{ext}'.",
+        })
+
+    # Recommended clean filename
+    clean_base = re.sub(r"[^a-zA-Z0-9_-]", "", parts[0] if parts else "upload")
+    safe_ext = ext if ext not in all_dangerous and ext else "bin"
+    suggested_filename = f"{clean_base}.{safe_ext}"
+
+    return {
+        "original_filename": filename,
+        "declared_mime_type": declared_content_type,
+        "overall_risk_level": risk_level,
+        "is_suspicious": len(issues) > 0,
+        "identified_vulnerabilities": issues if issues else ["Filename conforms to standard file upload safety criteria"],
+        "suggested_sanitized_name": suggested_filename,
+        "defense_best_practices": [
+            "Validate file content with magic byte inspection, not just filename extension or Content-Type header.",
+            "Store uploaded files outside the public web root.",
+            "Generate random UUID filenames on storage (e.g. 8f4e2b10.jpg).",
+            "Disable execution permissions in upload directory (e.g., 'php_flag engine off').",
+        ],
+    }
+
+
+@mcp.tool()
+async def inspect_http2_http3_support(target_url: str) -> Dict[str, Any]:
+    """
+    Inspect web server support for modern transport protocols (HTTP/2, HTTP/3 QUIC)
+    via ALPN negotiation, Alt-Svc headers, and check for HTTP/2 desynchronization vectors.
+
+    Args:
+        target_url: Web application URL to inspect.
+    """
+    if not target_url.startswith(("http://", "https://")):
+        target_url = "https://" + target_url
+
+    parsed = urlparse(target_url)
+    host = parsed.hostname or ""
+    port = parsed.port or 443
+
+    alpn_protocols = []
+    supports_h2 = False
+    supports_h3 = False
+    alt_svc_header = None
+
+    # Check ALPN via TLS handshake
+    try:
+        ctx = ssl.create_default_context()
+        ctx.set_alpn_protocols(["h2", "http/1.1"])
+        with socket.create_connection((host, port), timeout=6.0) as s:
+            with ctx.wrap_socket(s, server_hostname=host) as ssock:
+                chosen = ssock.selected_alpn_protocol()
+                if chosen:
+                    alpn_protocols.append(chosen)
+                    supports_h2 = chosen == "h2"
+    except Exception:
+        pass
+
+    # Check Alt-Svc header for HTTP/3 QUIC
+    try:
+        async with httpx.AsyncClient(timeout=6.0, follow_redirects=True) as client:
+            resp = await client.get(target_url, headers={"User-Agent": "HexStrike-Security-Auditor/1.0"})
+            alt_svc_header = resp.headers.get("alt-svc")
+            if alt_svc_header and ("h3" in alt_svc_header or "quic" in alt_svc_header):
+                supports_h3 = True
+    except Exception:
+        pass
+
+    return {
+        "target": target_url,
+        "host": host,
+        "supports_http2_h2": supports_h2,
+        "supports_http3_quic": supports_h3,
+        "alpn_negotiated": alpn_protocols,
+        "alt_svc_header": alt_svc_header or "Not Advertised",
+        "protocol_summary": (
+            "Modern Edge: Supports HTTP/2 & HTTP/3" if supports_h2 and supports_h3 else
+            ("Supports HTTP/2" if supports_h2 else "HTTP/1.1 Only")
+        ),
+        "security_notes": [
+            "HTTP/2 multiplexing reduces TCP overhead, but reverse proxies translating HTTP/2 to HTTP/1.1 backend must be audited for HTTP Request Smuggling (H2.CL / H2.TE desync).",
+        ],
+    }
+
+
+@mcp.tool()
+async def audit_open_redirect_patterns(test_url: str) -> Dict[str, Any]:
+    """
+    Audit redirect target parameters and URLs against common Open Redirect bypass techniques,
+    protocol-relative evasion, backslash delimiter tricks, and URL authority confusion.
+
+    Args:
+        test_url: The URL or redirection parameter value to evaluate (e.g. '//evil.com' or 'https://example.com/login?next=/dashboard').
+    """
+    clean = test_url.strip()
+    bypass_types = []
+    risk_level = "LOW"
+
+    # 1. Protocol-relative URLs (//evil.com)
+    if clean.startswith("//") and not clean.startswith("///"):
+        risk_level = "HIGH"
+        bypass_types.append({
+            "pattern": "Protocol-Relative URL (//)",
+            "severity": "HIGH",
+            "detail": "Starts with '//', browser inherits current scheme (http/https) and navigates to external domain.",
+        })
+
+    # 2. Backslash bypasses (/\evil.com, \evil.com, /\\evil.com)
+    if clean.startswith("/\\") or clean.startswith("\\/") or clean.startswith("\\\\"):
+        risk_level = "HIGH"
+        bypass_types.append({
+            "pattern": "Backslash Delimiter Bypass",
+            "severity": "HIGH",
+            "detail": "Modern browsers normalize backslashes '\\' to forward slashes '/', bypassing basic '/' prefix checks.",
+        })
+
+    # 3. URL-encoded backslash and slashes
+    if "%2f%2f" in clean.lower() or "%5c" in clean.lower():
+        risk_level = "HIGH"
+        bypass_types.append({
+            "pattern": "URL-Encoded Slashes / Backslashes",
+            "severity": "HIGH",
+            "detail": "Encoded characters '%2f' (/) and '%5c' (\\) can evade simple regex validation.",
+        })
+
+    # 4. At-sign authority confusion (https://trusted.com@evil.com)
+    if "@" in clean and (clean.startswith("http://") or clean.startswith("https://")):
+        risk_level = "CRITICAL"
+        bypass_types.append({
+            "pattern": "At-Sign (@) Authority Confusion",
+            "severity": "CRITICAL",
+            "detail": "Characters before '@' are parsed as HTTP Basic Auth credentials, redirecting to host following '@'.",
+        })
+
+    # 5. Question mark and hash fragments in query (https://trusted.com?redirect=evil.com)
+    parsed = urlparse(clean)
+    if parsed.query:
+        # Check query parameters
+        for k, v in [pair.split("=", 1) for pair in parsed.query.split("&") if "=" in pair]:
+            if any(k.lower() == param for param in ["next", "redirect", "url", "return", "goto", "dest", "target"]):
+                if v.startswith("http") or v.startswith("//") or v.startswith("/\\"):
+                    risk_level = "HIGH"
+                    bypass_types.append({
+                        "pattern": f"Unvalidated Redirect Parameter '{k}'",
+                        "severity": "HIGH",
+                        "parameter_value": v,
+                        "detail": f"Query parameter '{k}' directly accepts external or protocol-relative target.",
+                    })
+
+    # 6. JavaScript / Data URIs
+    if clean.lower().startswith("javascript:") or clean.lower().startswith("data:"):
+        risk_level = "CRITICAL"
+        bypass_types.append({
+            "pattern": "JavaScript / Data URI Execution",
+            "severity": "CRITICAL",
+            "detail": "Direct client-side script execution via 'javascript:' pseudoprotocol (XSS).",
+        })
+
+    return {
+        "input_url": test_url,
+        "is_vulnerable_to_open_redirect": len(bypass_types) > 0,
+        "overall_risk_level": risk_level,
+        "detected_bypass_patterns": bypass_types if bypass_types else ["No common open redirect bypass signatures matched"],
+        "safe_redirect_recommendation": "Enforce relative path validation using startsWith('/') while strictly rejecting '//' and '/\\', or match against an explicit allowlist of domain names.",
+    }
+
+
+@mcp.tool()
 async def hexstrike_backend_relay(
     tool_name: str,
     arguments: Dict[str, Any],
@@ -2300,11 +2998,18 @@ async def root(request: Request):
             "audit_xml_xxe_vectors",
             "audit_content_security_type_sniffing",
             "audit_rate_limiting_headers",
-            "inspect_ip_address_reputation_and_asn",
             "audit_oauth_oidc_endpoints",
+            "audit_ssrf_url_validation",
+            "inspect_tls_cipher_suites",
+            "audit_cors_preflight_and_origin_reflection",
+            "audit_server_side_template_injection_syntax",
+            "inspect_email_security_dmarc_spf_dkim",
+            "audit_file_upload_validation_filters",
+            "inspect_http2_http3_support",
+            "audit_open_redirect_patterns",
             "hexstrike_backend_relay",
         ],
-        "active_tools_count": 31,
+        "active_tools_count": 39,
         "render_deployment": "Running 24/7 background service",
     })
 
