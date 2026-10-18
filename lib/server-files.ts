@@ -288,16 +288,20 @@ from starlette.middleware.cors import CORSMiddleware
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
+raw_app = None
 if hasattr(mcp, "sse_app"):
-    app = mcp.sse_app()
+    try:
+        raw_app = mcp.sse_app()
+    except Exception:
+        raw_app = mcp.sse_app()
 elif hasattr(mcp, "_app") and mcp._app is not None:
-    app = mcp._app
+    raw_app = mcp._app
 elif hasattr(mcp, "http_app"):
-    app = mcp.http_app()
+    raw_app = mcp.http_app()
 else:
-    app = FastAPI(title="HexStrike AI FastMCP")
+    raw_app = FastAPI(title="HexStrike AI FastMCP")
 
-app.add_middleware(
+raw_app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
@@ -317,12 +321,23 @@ async def root(request: Request):
 async def health(request: Request):
     return JSONResponse({"status": "ok", "healthy": True})
 
-if hasattr(app, "routes"):
-    app.routes.insert(0, Route("/health", endpoint=health, methods=["GET"]))
-    app.routes.insert(0, Route("/", endpoint=root, methods=["GET"]))
-elif hasattr(app, "router") and hasattr(app.router, "add_route"):
-    app.router.add_route("/", root, methods=["GET"])
-    app.router.add_route("/health", health, methods=["GET"])
+if hasattr(raw_app, "routes"):
+    raw_app.routes.insert(0, Route("/health", endpoint=health, methods=["GET"]))
+    raw_app.routes.insert(0, Route("/", endpoint=root, methods=["GET"]))
+elif hasattr(raw_app, "router") and hasattr(raw_app.router, "add_route"):
+    raw_app.router.add_route("/", root, methods=["GET"])
+    raw_app.router.add_route("/health", health, methods=["GET"])
+
+class AllowAllHostsMiddleware:
+    def __init__(self, inner):
+        self.inner = inner
+    async def __call__(self, scope, receive, send):
+        if scope["type"] in ("http", "websocket"):
+            headers = [(b"host", b"localhost") if k.lower() == b"host" else (k, v) for k, v in scope.get("headers", [])]
+            scope["headers"] = headers
+        await self.inner(scope, receive, send)
+
+app = AllowAllHostsMiddleware(raw_app)
 
 if __name__ == "__main__":
     import uvicorn

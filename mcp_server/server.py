@@ -42,16 +42,41 @@ PORT = int(os.getenv("PORT", "8000"))
 HEXSTRIKE_BACKEND_URL = os.getenv("HEXSTRIKE_BACKEND_URL", "http://localhost:8888")
 MCP_AUTH_TOKEN = os.getenv("MCP_AUTH_TOKEN", "")
 
+# Configure Transport Security (DNS rebinding protection & allowed hosts for Render/Cloud)
+try:
+    from mcp.server.transport_security import TransportSecuritySettings
+    security_settings = TransportSecuritySettings(
+        enable_dns_rebinding_protection=False,
+        allowed_hosts=["*", "*.onrender.com", "localhost", "127.0.0.1"],
+    )
+except Exception:
+    security_settings = None
+
 # Initialize FastMCP Server
-mcp = FastMCP(
-    name="HexStrike-AI-ReverseEngineering",
-    instructions=(
+init_kwargs = {
+    "name": "HexStrike-AI-ReverseEngineering",
+    "instructions": (
         "HexStrike AI Reverse Engineering & Binary Analysis MCP Server. "
         "Provides tools for disassembling machine code, decompiling binary functions, "
         "entropy & packing detection, strings extraction, security mitigations check (ASLR/DEP/Canary), "
         "file header inspection, and integration with the HexStrike 150+ security tool suite."
     ),
-)
+}
+if security_settings:
+    init_kwargs["transport_security"] = security_settings
+
+try:
+    mcp = FastMCP(**init_kwargs)
+except TypeError:
+    init_kwargs.pop("transport_security", None)
+    mcp = FastMCP(**init_kwargs)
+
+if hasattr(mcp, "settings") and hasattr(mcp.settings, "transport_security"):
+    try:
+        mcp.settings.transport_security.enable_dns_rebinding_protection = False
+        mcp.settings.transport_security.allowed_hosts = ["*"]
+    except Exception:
+        pass
 
 # ---------------------------------------------------------------------------
 # Utility Functions
@@ -622,21 +647,28 @@ from starlette.middleware.cors import CORSMiddleware
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
+raw_app = None
 if hasattr(mcp, "sse_app"):
-    app = mcp.sse_app()
+    try:
+        if security_settings:
+            raw_app = mcp.sse_app(transport_security=security_settings)
+        else:
+            raw_app = mcp.sse_app()
+    except TypeError:
+        raw_app = mcp.sse_app()
 elif hasattr(mcp, "_app") and mcp._app is not None:
-    app = mcp._app
+    raw_app = mcp._app
 elif hasattr(mcp, "http_app"):
-    app = mcp.http_app()
+    raw_app = mcp.http_app()
 else:
-    app = FastAPI(
+    raw_app = FastAPI(
         title="HexStrike AI FastMCP Server",
         version="1.0.0",
         description="FastMCP Server for HexStrike AI Reverse Engineering",
     )
 
 # Enable CORS for web clients, Vercel frontends, and Claude Web
-app.add_middleware(
+raw_app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
@@ -675,12 +707,37 @@ async def health_check(request: Request):
     return JSONResponse({"status": "ok", "healthy": True, "uptime": "active"})
 
 # Safely attach routes to Starlette / FastAPI
-if hasattr(app, "routes"):
-    app.routes.insert(0, Route("/health", endpoint=health_check, methods=["GET"]))
-    app.routes.insert(0, Route("/", endpoint=root, methods=["GET"]))
-elif hasattr(app, "router") and hasattr(app.router, "add_route"):
-    app.router.add_route("/", root, methods=["GET"])
-    app.router.add_route("/health", health_check, methods=["GET"])
+if hasattr(raw_app, "routes"):
+    raw_app.routes.insert(0, Route("/health", endpoint=health_check, methods=["GET"]))
+    raw_app.routes.insert(0, Route("/", endpoint=root, methods=["GET"]))
+elif hasattr(raw_app, "router") and hasattr(raw_app.router, "add_route"):
+    raw_app.router.add_route("/", root, methods=["GET"])
+    raw_app.router.add_route("/health", health_check, methods=["GET"])
+
+
+class AllowAllHostsMiddleware:
+    """
+    ASGI middleware ensuring incoming Host headers pass FastMCP DNS rebinding checks
+    when deployed behind proxies like Render (*.onrender.com), Cloudflare, or Vercel.
+    This resolves the 'Invalid Host header' 421 issue completely.
+    """
+    def __init__(self, inner_app):
+        self.inner_app = inner_app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] in ("http", "websocket"):
+            headers = []
+            for name, value in scope.get("headers", []):
+                if name.lower() == b"host":
+                    headers.append((b"host", b"localhost"))
+                else:
+                    headers.append((name, value))
+            scope["headers"] = headers
+        await self.inner_app(scope, receive, send)
+
+
+# Wrap raw_app with AllowAllHostsMiddleware
+app = AllowAllHostsMiddleware(raw_app)
 
 
 if __name__ == "__main__":
