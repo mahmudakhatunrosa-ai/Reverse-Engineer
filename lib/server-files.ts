@@ -35,8 +35,14 @@ import logging
 from typing import Dict, List, Any, Optional
 import httpx
 from fastapi import FastAPI, Request, Response
-from fastapi.middleware.cors import CORSMiddleware
-from mcp.server.fastmcp import FastMCP
+# Flexible FastMCP import with resilient fallback for mcp 1.x, fastmcp, and mcp 2.x
+try:
+    from mcp.server.fastmcp import FastMCP
+except (ImportError, ModuleNotFoundError):
+    try:
+        from fastmcp import FastMCP
+    except (ImportError, ModuleNotFoundError):
+        from mcp.server.mcpserver import MCPServer as FastMCP
 
 # Setup logging
 logging.basicConfig(
@@ -277,8 +283,18 @@ async def hexstrike_backend_relay(tool_name: str, arguments: Dict[str, Any]) -> 
             "message": f"HexStrike backend at {HEXSTRIKE_BACKEND_URL} not active; tool '{tool_name}' captured.",
         }
 
-# FastAPI App
-app = mcp._app if hasattr(mcp, "_app") and isinstance(mcp._app, FastAPI) else FastAPI(title="HexStrike AI FastMCP")
+# ASGI App with sse_app() support and universal routes
+from starlette.middleware.cors import CORSMiddleware
+from starlette.responses import JSONResponse
+
+if hasattr(mcp, "sse_app"):
+    app = mcp.sse_app()
+elif hasattr(mcp, "_app") and mcp._app is not None:
+    app = mcp._app
+elif hasattr(mcp, "http_app"):
+    app = mcp.http_app()
+else:
+    app = FastAPI(title="HexStrike AI FastMCP")
 
 app.add_middleware(
     CORSMiddleware,
@@ -288,19 +304,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.get("/")
-async def root():
-    return {
+@app.route("/", methods=["GET"])
+async def root(request: Request):
+    return JSONResponse({
         "status": "online",
         "service": "HexStrike AI FastMCP Server",
         "sse_endpoint": "/sse",
         "health": "/health",
         "tools": ["inspect_binary_headers", "disassemble_machine_code", "analyze_entropy_and_packers", "extract_strings_and_secrets", "audit_security_mitigations", "decompile_function_pseudocode", "hexstrike_backend_relay"],
-    }
+    })
 
-@app.get("/health")
-async def health():
-    return {"status": "ok", "healthy": True}
+@app.route("/health", methods=["GET"])
+async def health(request: Request):
+    return JSONResponse({"status": "ok", "healthy": True})
 
 if __name__ == "__main__":
     import uvicorn
@@ -381,12 +397,19 @@ CMD ["sh", "-c", "uvicorn server:app --host 0.0.0.0 --port \${PORT}"]
 `,
   },
   {
+    name: ".python-version",
+    path: ".python-version",
+    language: "text",
+    description: "Specifies Python 3.11.9 for Render build environment",
+    content: `3.11.9
+`,
+  },
+  {
     name: "requirements.txt",
     path: "requirements.txt",
     language: "text",
-    description: "Python dependencies including FastMCP, MCP SDK, Uvicorn, and Capstone",
-    content: `fastmcp>=0.4.1
-mcp>=1.2.0
+    description: "Python dependencies with pinned mcp<2.0.0 to prevent ModuleNotFoundError",
+    content: `mcp>=1.2.0,<2.0.0
 uvicorn[standard]>=0.30.0
 fastapi>=0.111.0
 httpx>=0.27.0
@@ -394,6 +417,8 @@ pydantic>=2.7.0
 capstone>=5.0.0
 requests>=2.31.0
 python-multipart>=0.0.9
+starlette>=0.37.0
+sse-starlette>=2.1.0
 `,
   },
   {

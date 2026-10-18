@@ -21,8 +21,14 @@ import logging
 from typing import Dict, List, Any, Optional
 import httpx
 from fastapi import FastAPI, Request, Response
-from fastapi.middleware.cors import CORSMiddleware
-from mcp.server.fastmcp import FastMCP
+# Flexible FastMCP import with resilient fallback for mcp 1.x, fastmcp, and mcp 2.x
+try:
+    from mcp.server.fastmcp import FastMCP
+except (ImportError, ModuleNotFoundError):
+    try:
+        from fastmcp import FastMCP
+    except (ImportError, ModuleNotFoundError):
+        from mcp.server.mcpserver import MCPServer as FastMCP
 
 # Setup logging
 logging.basicConfig(
@@ -611,12 +617,22 @@ async def hexstrike_backend_relay(
 # FastAPI Mounting & SSE HTTP Endpoints (for Claude / Render / Vercel)
 # ---------------------------------------------------------------------------
 
-# Obtain the FastAPI/Starlette app from FastMCP
-app: FastAPI = mcp._app if hasattr(mcp, "_app") and isinstance(mcp._app, FastAPI) else FastAPI(
-    title="HexStrike AI FastMCP Server",
-    version="1.0.0",
-    description="FastMCP Server for HexStrike AI Reverse Engineering",
-)
+# Obtain the ASGI application from FastMCP (supports sse_app(), _app, and http_app())
+from starlette.middleware.cors import CORSMiddleware
+from starlette.responses import JSONResponse
+
+if hasattr(mcp, "sse_app"):
+    app = mcp.sse_app()
+elif hasattr(mcp, "_app") and mcp._app is not None:
+    app = mcp._app
+elif hasattr(mcp, "http_app"):
+    app = mcp.http_app()
+else:
+    app = FastAPI(
+        title="HexStrike AI FastMCP Server",
+        version="1.0.0",
+        description="FastMCP Server for HexStrike AI Reverse Engineering",
+    )
 
 # Enable CORS for web clients, Vercel frontends, and Claude Web
 app.add_middleware(
@@ -627,10 +643,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.get("/")
-async def root():
+@app.route("/", methods=["GET"])
+async def root(request: Request):
     """Server status overview and connection details for Claude."""
-    return {
+    return JSONResponse({
         "status": "online",
         "server": "HexStrike AI FastMCP Server",
         "version": "1.0.0",
@@ -651,13 +667,13 @@ async def root():
             "hexstrike_backend_relay",
         ],
         "render_deployment": "Running 24/7 background service",
-    }
+    })
 
 
-@app.get("/health")
-async def health_check():
+@app.route("/health", methods=["GET"])
+async def health_check(request: Request):
     """Render health check endpoint for monitoring & 24/7 uptime."""
-    return {"status": "ok", "healthy": True, "uptime": "active"}
+    return JSONResponse({"status": "ok", "healthy": True, "uptime": "active"})
 
 
 if __name__ == "__main__":
