@@ -620,6 +620,7 @@ async def hexstrike_backend_relay(
 # Obtain the ASGI application from FastMCP (supports sse_app(), _app, and http_app())
 from starlette.middleware.cors import CORSMiddleware
 from starlette.responses import JSONResponse
+from starlette.routing import Route
 
 if hasattr(mcp, "sse_app"):
     app = mcp.sse_app()
@@ -643,7 +644,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.route("/", methods=["GET"])
 async def root(request: Request):
     """Server status overview and connection details for Claude."""
     return JSONResponse({
@@ -670,10 +670,17 @@ async def root(request: Request):
     })
 
 
-@app.route("/health", methods=["GET"])
 async def health_check(request: Request):
     """Render health check endpoint for monitoring & 24/7 uptime."""
     return JSONResponse({"status": "ok", "healthy": True, "uptime": "active"})
+
+# Safely attach routes to Starlette / FastAPI
+if hasattr(app, "routes"):
+    app.routes.insert(0, Route("/health", endpoint=health_check, methods=["GET"]))
+    app.routes.insert(0, Route("/", endpoint=root, methods=["GET"]))
+elif hasattr(app, "router") and hasattr(app.router, "add_route"):
+    app.router.add_route("/", root, methods=["GET"])
+    app.router.add_route("/health", health_check, methods=["GET"])
 
 
 if __name__ == "__main__":

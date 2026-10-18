@@ -286,6 +286,7 @@ async def hexstrike_backend_relay(tool_name: str, arguments: Dict[str, Any]) -> 
 # ASGI App with sse_app() support and universal routes
 from starlette.middleware.cors import CORSMiddleware
 from starlette.responses import JSONResponse
+from starlette.routing import Route
 
 if hasattr(mcp, "sse_app"):
     app = mcp.sse_app()
@@ -304,7 +305,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.route("/", methods=["GET"])
 async def root(request: Request):
     return JSONResponse({
         "status": "online",
@@ -314,9 +314,15 @@ async def root(request: Request):
         "tools": ["inspect_binary_headers", "disassemble_machine_code", "analyze_entropy_and_packers", "extract_strings_and_secrets", "audit_security_mitigations", "decompile_function_pseudocode", "hexstrike_backend_relay"],
     })
 
-@app.route("/health", methods=["GET"])
 async def health(request: Request):
     return JSONResponse({"status": "ok", "healthy": True})
+
+if hasattr(app, "routes"):
+    app.routes.insert(0, Route("/health", endpoint=health, methods=["GET"]))
+    app.routes.insert(0, Route("/", endpoint=root, methods=["GET"]))
+elif hasattr(app, "router") and hasattr(app.router, "add_route"):
+    app.router.add_route("/", root, methods=["GET"])
+    app.router.add_route("/health", health, methods=["GET"])
 
 if __name__ == "__main__":
     import uvicorn
