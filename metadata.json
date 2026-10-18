@@ -1,0 +1,6 @@
+{
+  "name": "HexStrike AI FastMCP Server",
+  "description": "Production FastMCP server for HexStrike AI reverse engineering & security toolkit with 24/7 Render deployment guides, live testing console, and Claude MCP configs.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
