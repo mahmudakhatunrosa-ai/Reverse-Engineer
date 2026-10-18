@@ -20,6 +20,8 @@ import struct
 import logging
 import socket
 import ssl
+import hashlib
+import ipaddress
 from urllib.parse import urlparse, urljoin
 from datetime import datetime
 from typing import Dict, List, Any, Optional
@@ -1594,6 +1596,586 @@ async def deobfuscate_javascript_snippet(obfuscated_js: str) -> Dict[str, Any]:
 
 
 @mcp.tool()
+async def identify_hash_algorithm(hash_string: str) -> Dict[str, Any]:
+    """
+    Identify cryptographic hash algorithms, password hash formats, salts, and cost factors.
+    Evaluates algorithmic collision resistance and security posture according to NIST/OWASP standards.
+
+    Args:
+        hash_string: Cryptographic hash, password digest, or modular crypt format string to analyze.
+    """
+    clean_hash = hash_string.strip()
+    length = len(clean_hash)
+    is_hex = bool(re.fullmatch(r"[0-9a-fA-F]+", clean_hash))
+    candidates = []
+    category = "Unknown"
+    security_rating = "UNKNOWN"
+    recommendation = "Verify hash format and origin."
+
+    # Modular Crypt Format / Salted Hashes
+    if clean_hash.startswith("$2a$") or clean_hash.startswith("$2b$") or clean_hash.startswith("$2y$"):
+        parts = clean_hash.split("$")
+        cost = parts[2] if len(parts) > 2 else "Unknown"
+        candidates.append({
+            "algorithm": "bcrypt",
+            "subtype": f"Blowfish-based crypt ({parts[1]})",
+            "cost_factor_rounds": f"2^{cost} iterations",
+            "security_level": "STRONG",
+        })
+        category = "Adaptive Password Hash"
+        security_rating = "HARDENED_PASSWORD_HASH"
+        recommendation = "bcrypt is currently OWASP compliant for password hashing (min cost 10-12)."
+
+    elif clean_hash.startswith("$argon2id$") or clean_hash.startswith("$argon2i$") or clean_hash.startswith("$argon2d$"):
+        candidates.append({
+            "algorithm": "Argon2",
+            "subtype": clean_hash.split("$")[1],
+            "security_level": "STATE_OF_THE_ART",
+        })
+        category = "Memory-Hard Password Hash"
+        security_rating = "RECOMMENDED_STANDARD"
+        recommendation = "Argon2id winner of Password Hashing Competition; highly recommended."
+
+    elif clean_hash.startswith("$6$"):
+        candidates.append({"algorithm": "SHA-512 crypt", "security_level": "ACCEPTABLE"})
+        category = "Unix Shadow Hash"
+        security_rating = "ACCEPTABLE"
+        recommendation = "Standard Linux /etc/shadow hash. Consider upgrading to Argon2id."
+
+    elif clean_hash.startswith("$5$"):
+        candidates.append({"algorithm": "SHA-256 crypt", "security_level": "ACCEPTABLE"})
+        category = "Unix Shadow Hash"
+        security_rating = "ACCEPTABLE"
+        recommendation = "Standard Linux /etc/shadow hash."
+
+    elif clean_hash.startswith("$1$"):
+        candidates.append({"algorithm": "MD5 crypt", "security_level": "BROKEN"})
+        category = "Legacy Unix Hash"
+        security_rating = "COMPROMISED"
+        recommendation = "MD5 crypt is trivially crackable via GPU. Upgrade immediately."
+
+    elif is_hex:
+        if length == 32:
+            candidates.extend([
+                {"algorithm": "MD5", "digest_bits": 128, "security_level": "COLLISION_BROKEN"},
+                {"algorithm": "NTLM", "digest_bits": 128, "security_level": "INSECURE"},
+                {"algorithm": "MD4", "digest_bits": 128, "security_level": "COMPLETELY_BROKEN"},
+            ])
+            category = "128-bit Hex Digest"
+            security_rating = "BROKEN_OR_OBSOLETE"
+            recommendation = "MD5 and NTLM have severe collision and pre-image weaknesses. Do not use for security."
+        elif length == 40:
+            candidates.extend([
+                {"algorithm": "SHA-1", "digest_bits": 160, "security_level": "COLLISION_BROKEN (SHAttered attack)"},
+                {"algorithm": "RIPEMD-160", "digest_bits": 160, "security_level": "LEGACY"},
+            ])
+            category = "160-bit Hex Digest"
+            security_rating = "DEPRECATED"
+            recommendation = "SHA-1 is deprecated by NIST due to practical collision generation."
+        elif length == 56:
+            candidates.extend([
+                {"algorithm": "SHA-224", "digest_bits": 224, "security_level": "ADEQUATE"},
+                {"algorithm": "SHA3-224", "digest_bits": 224, "security_level": "MODERN"},
+            ])
+            category = "224-bit Hex Digest"
+            security_rating = "ADEQUATE"
+        elif length == 64:
+            candidates.extend([
+                {"algorithm": "SHA-256 (SHA-2)", "digest_bits": 256, "security_level": "HIGH"},
+                {"algorithm": "SHA3-256 (Keccak)", "digest_bits": 256, "security_level": "VERY_HIGH"},
+                {"algorithm": "BLAKE2s", "digest_bits": 256, "security_level": "HIGH"},
+            ])
+            category = "256-bit Hex Digest"
+            security_rating = "MODERN_SECURE_DIGEST"
+            recommendation = "SHA-256 and SHA3-256 are standard for cryptographic data integrity verification."
+        elif length == 96:
+            candidates.extend([
+                {"algorithm": "SHA-384", "digest_bits": 384, "security_level": "VERY_HIGH"},
+                {"algorithm": "SHA3-384", "digest_bits": 384, "security_level": "VERY_HIGH"},
+            ])
+            category = "384-bit Hex Digest"
+            security_rating = "HIGH_SECURITY"
+        elif length == 128:
+            candidates.extend([
+                {"algorithm": "SHA-512 (SHA-2)", "digest_bits": 512, "security_level": "MAXIMUM"},
+                {"algorithm": "SHA3-512", "digest_bits": 512, "security_level": "MAXIMUM"},
+                {"algorithm": "Whirlpool", "digest_bits": 512, "security_level": "HIGH"},
+                {"algorithm": "BLAKE2b", "digest_bits": 512, "security_level": "MAXIMUM"},
+            ])
+            category = "512-bit Hex Digest"
+            security_rating = "MAXIMUM_SECURITY"
+
+    return {
+        "hash_input": clean_hash[:64] + ("..." if length > 64 else ""),
+        "char_length": length,
+        "is_hexadecimal": is_hex,
+        "category": category,
+        "security_rating": security_rating,
+        "probable_algorithms": candidates if candidates else ["Unknown or proprietary hash format"],
+        "recommendation": recommendation,
+    }
+
+
+@mcp.tool()
+async def audit_directory_listing_and_sensitive_paths(target_url: str) -> Dict[str, Any]:
+    """
+    Audit web application for sensitive path exposure, directory listing leaks,
+    unprotected .git metadata, environment files, and administrative backups.
+
+    Args:
+        target_url: The root website URL to inspect (e.g., 'https://example.com').
+    """
+    if not target_url.startswith(("http://", "https://")):
+        target_url = "https://" + target_url
+
+    parsed = urlparse(target_url)
+    base_url = f"{parsed.scheme}://{parsed.netloc}"
+
+    critical_paths = [
+        {"path": "/.git/HEAD", "type": "Git Repository Exposure", "risk": "CRITICAL"},
+        {"path": "/.env", "type": "Environment Secrets Exposure", "risk": "CRITICAL"},
+        {"path": "/.env.local", "type": "Local Environment Config", "risk": "CRITICAL"},
+        {"path": "/backup.zip", "type": "Public Backup Archive", "risk": "HIGH"},
+        {"path": "/database.sql", "type": "SQL Database Dump Leak", "risk": "CRITICAL"},
+        {"path": "/server-status", "type": "Apache Server Status Info Leak", "risk": "MEDIUM"},
+        {"path": "/phpinfo.php", "type": "PHPInfo Configuration Exposure", "risk": "HIGH"},
+        {"path": "/wp-config.php.bak", "type": "WordPress Configuration Backup", "risk": "CRITICAL"},
+        {"path": "/.docker/config.json", "type": "Docker Credentials Leak", "risk": "CRITICAL"},
+    ]
+
+    findings = []
+    directory_listing_enabled = False
+
+    async with httpx.AsyncClient(timeout=8.0, follow_redirects=False) as client:
+        # Check root or uploads directory for index browsing signatures
+        try:
+            resp = await client.get(base_url + "/")
+            body = resp.text.lower()
+            if "index of /" in body or "<title>index of" in body or "parent directory</a>" in body:
+                directory_listing_enabled = True
+        except Exception:
+            pass
+
+        for entry in critical_paths:
+            probe_url = base_url + entry["path"]
+            try:
+                r = await client.get(probe_url, headers={"User-Agent": "HexStrike-Security-Auditor/1.0"})
+                # If HTTP 200 and not a generic HTML redirect or custom 404
+                if r.status_code == 200:
+                    text_sample = r.text[:200]
+                    # Validate content signature to avoid false positives on SPA catch-alls
+                    is_real = False
+                    if entry["path"] == "/.git/HEAD" and "ref: refs/" in text_sample:
+                        is_real = True
+                    elif entry["path"] in ["/.env", "/.env.local"] and ("=" in text_sample and ("DB_" in text_sample or "API_" in text_sample or "SECRET" in text_sample or "PORT=" in text_sample)):
+                        is_real = True
+                    elif entry["path"] == "/server-status" and "apache server status" in text_sample.lower():
+                        is_real = True
+                    elif entry["path"] == "/phpinfo.php" and "php version" in text_sample.lower():
+                        is_real = True
+                    elif len(r.content) > 0 and r.headers.get("content-type", "").startswith(("application/", "text/plain")):
+                        is_real = True
+
+                    if is_real:
+                        findings.append({
+                            "path": entry["path"],
+                            "full_url": probe_url,
+                            "type": entry["type"],
+                            "risk": entry["risk"],
+                            "status_code": r.status_code,
+                            "content_type": r.headers.get("content-type", ""),
+                            "evidence": text_sample[:80],
+                        })
+            except Exception:
+                continue
+
+    return {
+        "target": base_url,
+        "directory_listing_detected": directory_listing_enabled,
+        "findings_count": len(findings),
+        "vulnerabilities": findings,
+        "posture_summary": "CRITICAL RISK: Sensitive configuration files or source code exposed!" if findings else "CLEAN: No common sensitive backup or git paths accessible on target root.",
+    }
+
+
+@mcp.tool()
+async def audit_graphql_introspection(endpoint_url: str) -> Dict[str, Any]:
+    """
+    Audit a GraphQL API endpoint to test whether Schema Introspection is enabled in production,
+    which exposes the full API schema, object types, fields, queries, and mutations.
+
+    Args:
+        endpoint_url: GraphQL endpoint URL (e.g. 'https://api.example.com/graphql').
+    """
+    if not endpoint_url.startswith(("http://", "https://")):
+        endpoint_url = "https://" + endpoint_url
+
+    introspection_query = {
+        "query": "query IntrospectionTest { __schema { queryType { name } types { name kind } } }"
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                endpoint_url,
+                json=introspection_query,
+                headers={"Content-Type": "application/json", "User-Agent": "HexStrike-Security-Auditor/1.0"},
+            )
+            is_json = "application/json" in resp.headers.get("content-type", "").lower()
+            if not is_json:
+                return {
+                    "endpoint": endpoint_url,
+                    "is_graphql": False,
+                    "status_code": resp.status_code,
+                    "message": "Endpoint returned non-JSON response.",
+                }
+
+            data = resp.json()
+            schema_data = data.get("data", {}).get("__schema")
+
+            if schema_data:
+                types = [t.get("name") for t in schema_data.get("types", []) if not t.get("name", "").startswith("__")]
+                return {
+                    "endpoint": endpoint_url,
+                    "introspection_enabled": True,
+                    "risk_severity": "MEDIUM_HIGH",
+                    "issue": "GraphQL Introspection is publicly enabled in production",
+                    "impact": "Attackers can reverse-engineer internal database entities, hidden mutations, and unpublished queries.",
+                    "types_exposed_count": len(types),
+                    "exposed_types_sample": types[:25],
+                    "remediation": "Disable introspection in production (e.g. in Apollo Server: 'introspection: false', Yoga: 'useDisableIntrospection()').",
+                }
+
+            errors = data.get("errors", [])
+            error_messages = [e.get("message", "") for e in errors]
+            return {
+                "endpoint": endpoint_url,
+                "introspection_enabled": False,
+                "risk_severity": "LOW",
+                "message": "GraphQL introspection query was rejected or disabled.",
+                "server_response": error_messages[:3],
+            }
+
+    except Exception as e:
+        return {
+            "endpoint": endpoint_url,
+            "error": f"Failed to test GraphQL endpoint: {str(e)}",
+        }
+
+
+@mcp.tool()
+async def audit_xml_xxe_vectors(xml_content: str) -> Dict[str, Any]:
+    """
+    Audit XML payloads, configuration files, and SOAP messages for XML External Entity (XXE)
+    vulnerabilities, billion laughs entity expansion bombs, and SSRF entity injection risks.
+
+    Args:
+        xml_content: Raw XML payload or document string to audit.
+    """
+    issues = []
+    risk_level = "LOW"
+
+    # 1. DOCTYPE check
+    has_doctype = bool(re.search(r"<!DOCTYPE\s+", xml_content, re.IGNORECASE))
+    if has_doctype:
+        issues.append({
+            "vector": "DOCTYPE Declaration Present",
+            "severity": "MEDIUM",
+            "detail": "XML DOCTYPE header is declared. If DTD processing is enabled on the server, XXE is possible.",
+        })
+
+    # 2. External SYSTEM / PUBLIC Entity
+    system_entities = re.findall(r'<!ENTITY\s+([^\s>]+)\s+SYSTEM\s+["\']([^"\']+)["\']', xml_content, re.IGNORECASE)
+    if system_entities:
+        risk_level = "CRITICAL"
+        for ent_name, ent_uri in system_entities:
+            issues.append({
+                "vector": "SYSTEM External Entity (XXE)",
+                "severity": "CRITICAL",
+                "entity": ent_name,
+                "target_uri": ent_uri,
+                "vulnerability": "Arbitrary file reading (file://), SSRF (http://), or cloud credential theft.",
+            })
+
+    # 3. Parameter Entities (Out-of-Band XXE)
+    param_entities = re.findall(r'<!ENTITY\s+%\s+([^\s>]+)\s+SYSTEM\s+["\']([^"\']+)["\']', xml_content, re.IGNORECASE)
+    if param_entities:
+        risk_level = "CRITICAL"
+        for pent_name, pent_uri in param_entities:
+            issues.append({
+                "vector": "Parameter Entity (Blind / Out-of-band XXE)",
+                "severity": "CRITICAL",
+                "entity": pent_name,
+                "target_uri": pent_uri,
+            })
+
+    # 4. Billion Laughs / Exponential Entity Expansion
+    entities = re.findall(r'<!ENTITY\s+([^\s>]+)\s+["\']([^"\']+)["\']', xml_content, re.IGNORECASE)
+    if len(entities) > 5:
+        # Check if entities reference other entities
+        nested_refs = sum(1 for _, val in entities if "&" in val)
+        if nested_refs >= 3:
+            risk_level = "HIGH"
+            issues.append({
+                "vector": "Billion Laughs / Recursive Entity Expansion",
+                "severity": "HIGH",
+                "vulnerability": "XML Entity Expansion Denial of Service (CPU & RAM exhaustion).",
+            })
+
+    # 5. XInclude tags
+    if "xi:include" in xml_content:
+        issues.append({
+            "vector": "XInclude Injection",
+            "severity": "HIGH",
+            "vulnerability": "xi:include tag detected. Server parsers with XInclude enabled may load external resources.",
+        })
+
+    return {
+        "analyzed_length": len(xml_content),
+        "overall_risk_level": risk_level,
+        "vulnerabilities_detected": len(issues),
+        "issues": issues if issues else ["No XXE or dangerous DTD entities detected"],
+        "secure_coding_guidelines": [
+            "Python: Use defusedxml package instead of standard xml.etree or minidom.",
+            "Java: factory.setFeature('http://apache.org/xml/features/disallow-doctype-decl', true)",
+            "Node.js: Set { noent: false, dtd: false } in libxmljs / xml2js.",
+            "PHP: libxml_disable_entity_loader(true)",
+        ],
+    }
+
+
+@mcp.tool()
+async def audit_content_security_type_sniffing(target_url: str) -> Dict[str, Any]:
+    """
+    Audit web application MIME-type enforcement, X-Content-Type-Options: nosniff protection,
+    and cross-site script inclusion (XSSI) risks.
+
+    Args:
+        target_url: Web application URL or asset endpoint to inspect.
+    """
+    if not target_url.startswith(("http://", "https://")):
+        target_url = "https://" + target_url
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+            resp = await client.get(target_url, headers={"User-Agent": "HexStrike-Security-Auditor/1.0"})
+            headers = resp.headers
+
+            content_type = headers.get("content-type", "")
+            nosniff = headers.get("x-content-type-options", "").lower().strip() == "nosniff"
+
+            vulnerabilities = []
+            if not nosniff:
+                vulnerabilities.append({
+                    "issue": "Missing 'X-Content-Type-Options: nosniff' Header",
+                    "severity": "MEDIUM",
+                    "impact": "Legacy and modern browsers may MIME-sniff response content, potentially executing untrusted user uploads as HTML/JavaScript (Stored XSS).",
+                })
+
+            if not content_type:
+                vulnerabilities.append({
+                    "issue": "Missing Content-Type Header",
+                    "severity": "MEDIUM",
+                    "impact": "Browser is forced to guess content type based on payload inspection.",
+                })
+
+            if "image/svg+xml" in content_type and not headers.get("content-security-policy"):
+                vulnerabilities.append({
+                    "issue": "SVG Served without Content-Security-Policy",
+                    "severity": "HIGH",
+                    "impact": "SVG documents can execute embedded JavaScript (<script> tags) when viewed directly.",
+                })
+
+            return {
+                "url": target_url,
+                "status_code": resp.status_code,
+                "content_type": content_type,
+                "nosniff_header_present": nosniff,
+                "vulnerabilities": vulnerabilities if vulnerabilities else ["MIME-type enforcement is appropriately configured."],
+                "recommendation": "Always enforce 'X-Content-Type-Options: nosniff' and explicit charset definitions.",
+            }
+    except Exception as e:
+        return {"target": target_url, "error": f"Failed to test MIME security: {str(e)}"}
+
+
+@mcp.tool()
+async def audit_rate_limiting_headers(target_url: str) -> Dict[str, Any]:
+    """
+    Audit web and API endpoints for rate limiting defenses, anti-brute-force headers,
+    and HTTP throttling controls (RFC 6585, RateLimit-*, X-RateLimit-*).
+
+    Args:
+        target_url: API or login endpoint URL to test.
+    """
+    if not target_url.startswith(("http://", "https://")):
+        target_url = "https://" + target_url
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+            resp = await client.get(target_url, headers={"User-Agent": "HexStrike-Security-Auditor/1.0"})
+            h = resp.headers
+
+            rate_limit_headers = {}
+            for key, val in h.items():
+                if "ratelimit" in key.lower() or "retry-after" in key.lower() or "throttle" in key.lower():
+                    rate_limit_headers[key] = val
+
+            has_rate_limiting = len(rate_limit_headers) > 0
+            is_login_or_auth = any(keyword in target_url.lower() for keyword in ["login", "signin", "auth", "token", "password", "api"])
+
+            risk = "LOW"
+            if is_login_or_auth and not has_rate_limiting:
+                risk = "HIGH"
+                recommendation = "Authentication/API endpoint lacks rate limiting headers. Vulnerable to credential stuffing & password brute force."
+            elif not has_rate_limiting:
+                risk = "MEDIUM"
+                recommendation = "Implement rate limiting middleware (e.g., redis token bucket or Cloudflare Rate Limiting Rules)."
+            else:
+                recommendation = "Rate limit headers detected. Ensure limits are securely bound per-IP or per-User."
+
+            return {
+                "target_url": target_url,
+                "status_code": resp.status_code,
+                "rate_limiting_detected": has_rate_limiting,
+                "risk_rating": risk,
+                "rate_limit_headers": rate_limit_headers if rate_limit_headers else "None present in response",
+                "recommendation": recommendation,
+            }
+    except Exception as e:
+        return {"target": target_url, "error": f"Failed to test rate limiting: {str(e)}"}
+
+
+@mcp.tool()
+async def inspect_ip_address_reputation_and_asn(target: str) -> Dict[str, Any]:
+    """
+    Inspect an IP address or domain for network ASN, reverse DNS PTR records,
+    hosting cloud provider identification, and edge WAF / CDN proxy layer detection.
+
+    Args:
+        target: Domain name (e.g. 'example.com') or IP address (e.g. '93.184.216.34').
+    """
+    clean_target = target.strip().replace("http://", "").replace("https://", "").split("/")[0].split(":")[0]
+
+    # Resolve IP
+    resolved_ips = []
+    try:
+        resolved_ips = [ai[4][0] for ai in socket.getaddrinfo(clean_target, None)]
+        resolved_ips = list(set(resolved_ips))
+    except Exception:
+        pass
+
+    primary_ip = resolved_ips[0] if resolved_ips else clean_target
+
+    # Reverse DNS lookup
+    reverse_ptr = "None"
+    try:
+        reverse_ptr = socket.gethostbyaddr(primary_ip)[0]
+    except Exception:
+        pass
+
+    # Detect edge CDN / WAF provider
+    proxy_provider = "Direct Origin / Independent Cloud"
+    combined_info = (reverse_ptr + " " + primary_ip).lower()
+    if "cloudflare" in combined_info or primary_ip.startswith(("104.", "172.64.", "172.67.", "108.162.")):
+        proxy_provider = "Cloudflare CDN / WAF Edge"
+    elif "cloudfront" in combined_info or "aws" in combined_info:
+        proxy_provider = "Amazon AWS (CloudFront / EC2 / ALB)"
+    elif "google" in combined_info or "1e100.net" in reverse_ptr:
+        proxy_provider = "Google Cloud Platform"
+    elif "azure" in combined_info or "trafficmanager.net" in reverse_ptr:
+        proxy_provider = "Microsoft Azure"
+    elif "fastly" in combined_info:
+        proxy_provider = "Fastly Edge Cloud"
+    elif "akamai" in combined_info:
+        proxy_provider = "Akamai CDN / WAF"
+    elif "digitalocean" in combined_info:
+        proxy_provider = "DigitalOcean Cloud"
+
+    return {
+        "target": target,
+        "clean_host": clean_target,
+        "resolved_ips": resolved_ips,
+        "primary_ip": primary_ip,
+        "reverse_dns_ptr": reverse_ptr,
+        "detected_edge_provider": proxy_provider,
+        "is_behind_waf_or_cdn": proxy_provider != "Direct Origin / Independent Cloud",
+        "pentest_guidance": "Target is behind a CDN/WAF. Direct origin IP discovery is required to bypass cloud firewall rules." if proxy_provider != "Direct Origin / Independent Cloud" else "Target appears directly hosted; network discovery and port auditing are directly applicable.",
+    }
+
+
+@mcp.tool()
+async def audit_oauth_oidc_endpoints(issuer_url: str) -> Dict[str, Any]:
+    """
+    Audit OpenID Connect (OIDC) and OAuth 2.0 authorization server discovery configurations
+    (RFC 8414 / OpenID Connect Discovery) for insecure grant types, PKCE enforcement, and leaked endpoints.
+
+    Args:
+        issuer_url: Domain or issuer URL (e.g. 'https://accounts.google.com' or 'https://auth.example.com').
+    """
+    if not issuer_url.startswith(("http://", "https://")):
+        issuer_url = "https://" + issuer_url
+
+    parsed = urlparse(issuer_url)
+    base_url = f"{parsed.scheme}://{parsed.netloc}"
+
+    discovery_urls = [
+        f"{base_url}/.well-known/openid-configuration",
+        f"{base_url}/.well-known/oauth-authorization-server",
+    ]
+
+    async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+        config = None
+        used_url = None
+        for d_url in discovery_urls:
+            try:
+                r = await client.get(d_url, headers={"User-Agent": "HexStrike-Security-Auditor/1.0"})
+                if r.status_code == 200 and "json" in r.headers.get("content-type", "").lower():
+                    config = r.json()
+                    used_url = d_url
+                    break
+            except Exception:
+                continue
+
+    if not config:
+        return {
+            "issuer": issuer_url,
+            "openid_configuration_found": False,
+            "message": "No standard OIDC /.well-known/openid-configuration endpoint found.",
+        }
+
+    pkce_methods = config.get("code_challenge_methods_supported", [])
+    grant_types = config.get("grant_types_supported", ["authorization_code", "implicit"])
+    response_types = config.get("response_types_supported", [])
+
+    security_warnings = []
+    if not pkce_methods:
+        security_warnings.append("PKCE (RFC 7636) is not documented as supported. Susceptible to authorization code interception.")
+    elif "S256" not in pkce_methods:
+        security_warnings.append("PKCE is supported but missing mandatory SHA-256 ('S256') method.")
+
+    if "password" in grant_types:
+        security_warnings.append("Resource Owner Password Credentials (ROPC) grant is supported. Deprecated in OAuth 2.1 due to credential exposure.")
+
+    if any("token" in rt for rt in response_types):
+        security_warnings.append("Implicit flow (response_type=token) is supported. Deprecated in OAuth 2.1 due to token leakage in URL fragments.")
+
+    return {
+        "issuer": config.get("issuer", issuer_url),
+        "discovery_url": used_url,
+        "endpoints": {
+            "authorization_endpoint": config.get("authorization_endpoint"),
+            "token_endpoint": config.get("token_endpoint"),
+            "userinfo_endpoint": config.get("userinfo_endpoint"),
+            "jwks_uri": config.get("jwks_uri"),
+            "revocation_endpoint": config.get("revocation_endpoint"),
+        },
+        "pkce_methods_supported": pkce_methods,
+        "security_warnings": security_warnings if security_warnings else ["OIDC configuration aligns with modern OAuth 2.1 best practices."],
+        "oauth2_1_compliance": "COMPLIANT" if not security_warnings else "NEEDS_HARDENING",
+    }
+
+
+@mcp.tool()
 async def hexstrike_backend_relay(
     tool_name: str,
     arguments: Dict[str, Any],
@@ -1712,9 +2294,17 @@ async def root(request: Request):
             "analyze_web_tech_stack",
             "audit_subdomain_takeover_cnames",
             "deobfuscate_javascript_snippet",
+            "identify_hash_algorithm",
+            "audit_directory_listing_and_sensitive_paths",
+            "audit_graphql_introspection",
+            "audit_xml_xxe_vectors",
+            "audit_content_security_type_sniffing",
+            "audit_rate_limiting_headers",
+            "inspect_ip_address_reputation_and_asn",
+            "audit_oauth_oidc_endpoints",
             "hexstrike_backend_relay",
         ],
-        "active_tools_count": 23,
+        "active_tools_count": 31,
         "render_deployment": "Running 24/7 background service",
     })
 

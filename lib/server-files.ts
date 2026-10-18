@@ -539,6 +539,122 @@ async def deobfuscate_javascript_snippet(obfuscated_js: str) -> Dict[str, Any]:
     return {"original_len": len(obfuscated_js), "deobfuscated_preview": code[:800], "has_eval": "eval(" in code}
 
 @mcp.tool()
+async def identify_hash_algorithm(hash_string: str) -> Dict[str, Any]:
+    """Identify cryptographic hash algorithms, bcrypt/Argon2 formats, and collision risks."""
+    h = hash_string.strip()
+    l = len(h)
+    if h.startswith(("$2a$", "$2b$", "$2y$")):
+        return {"algorithm": "bcrypt", "security": "STRONG", "category": "Password Hash"}
+    if h.startswith(("$argon2id$", "$argon2i$")):
+        return {"algorithm": "Argon2", "security": "STATE_OF_THE_ART", "category": "Memory-Hard Hash"}
+    if l == 32:
+        return {"algorithm": "MD5 / NTLM", "security": "INSECURE / BROKEN", "category": "128-bit Digest"}
+    if l == 40:
+        return {"algorithm": "SHA-1", "security": "DEPRECATED (SHAttered)", "category": "160-bit Digest"}
+    if l == 64:
+        return {"algorithm": "SHA-256 / SHA3-256", "security": "STRONG", "category": "256-bit Digest"}
+    if l == 128:
+        return {"algorithm": "SHA-512 / BLAKE2b", "security": "MAXIMUM", "category": "512-bit Digest"}
+    return {"hash_length": l, "algorithm": "Unknown/Custom", "security": "UNKNOWN"}
+
+@mcp.tool()
+async def audit_directory_listing_and_sensitive_paths(target_url: str) -> Dict[str, Any]:
+    """Check target web root for exposed .git, .env, backups, and directory listing."""
+    base = target_url.rstrip("/")
+    if not base.startswith(("http://", "https://")):
+        base = "https://" + base
+    probes = ["/.git/HEAD", "/.env", "/backup.zip", "/database.sql", "/server-status", "/phpinfo.php"]
+    hits = []
+    async with httpx.AsyncClient(timeout=6.0) as c:
+        for p in probes:
+            try:
+                r = await c.get(base + p)
+                if r.status_code == 200 and len(r.content) > 0:
+                    hits.append({"path": p, "status": 200, "content_type": r.headers.get("content-type")})
+            except Exception:
+                continue
+    return {"target": base, "exposed_paths_found": hits, "is_vulnerable": len(hits) > 0}
+
+@mcp.tool()
+async def audit_graphql_introspection(endpoint_url: str) -> Dict[str, Any]:
+    """Audit GraphQL endpoint to test whether production schema introspection is enabled."""
+    url = endpoint_url if endpoint_url.startswith(("http://", "https://")) else "https://" + endpoint_url
+    q = {"query": "query { __schema { queryType { name } types { name } } }"}
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as c:
+            r = await c.post(url, json=q, headers={"Content-Type": "application/json"})
+            schema = r.json().get("data", {}).get("__schema")
+            return {"endpoint": url, "introspection_enabled": bool(schema), "types_count": len(schema.get("types", [])) if schema else 0}
+    except Exception as e:
+        return {"error": str(e)}
+
+@mcp.tool()
+async def audit_xml_xxe_vectors(xml_content: str) -> Dict[str, Any]:
+    """Audit XML payload for DOCTYPE, SYSTEM entities, and Billion Laughs DoS vectors."""
+    has_system = "SYSTEM" in xml_content.upper()
+    has_doctype = "<!DOCTYPE" in xml_content.upper()
+    has_xinclude = "xi:include" in xml_content.lower()
+    return {
+        "has_doctype": has_doctype,
+        "has_system_external_entity": has_system,
+        "has_xinclude": has_xinclude,
+        "risk_level": "CRITICAL" if has_system else ("MEDIUM" if has_doctype else "LOW"),
+    }
+
+@mcp.tool()
+async def audit_content_security_type_sniffing(target_url: str) -> Dict[str, Any]:
+    """Check MIME sniffing protections and X-Content-Type-Options: nosniff header."""
+    url = target_url if target_url.startswith(("http://", "https://")) else "https://" + target_url
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as c:
+            r = await c.get(url)
+            nosniff = r.headers.get("x-content-type-options", "").lower() == "nosniff"
+            return {"url": url, "nosniff_present": nosniff, "content_type": r.headers.get("content-type")}
+    except Exception as e:
+        return {"error": str(e)}
+
+@mcp.tool()
+async def audit_rate_limiting_headers(target_url: str) -> Dict[str, Any]:
+    """Inspect web endpoint response headers for standard RFC and custom rate-limiting controls."""
+    url = target_url if target_url.startswith(("http://", "https://")) else "https://" + target_url
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as c:
+            r = await c.get(url)
+            rl = {k: v for k, v in r.headers.items() if "ratelimit" in k.lower() or "retry-after" in k.lower()}
+            return {"url": url, "rate_limiting_detected": len(rl) > 0, "headers": rl}
+    except Exception as e:
+        return {"error": str(e)}
+
+@mcp.tool()
+async def inspect_ip_address_reputation_and_asn(target: str) -> Dict[str, Any]:
+    """Resolve IP, check reverse PTR, and detect edge Cloud/WAF layers (Cloudflare, AWS, etc.)."""
+    host = target.replace("https://", "").replace("http://", "").split("/")[0].split(":")[0]
+    try:
+        ips = [ai[4][0] for ai in socket.getaddrinfo(host, None)]
+        ptr = socket.gethostbyaddr(ips[0])[0] if ips else "None"
+        is_waf = any(w in (ptr + ips[0]).lower() for w in ["cloudflare", "cloudfront", "fastly", "akamai"])
+        return {"host": host, "resolved_ips": list(set(ips)), "reverse_dns": ptr, "behind_waf_or_cdn": is_waf}
+    except Exception as e:
+        return {"error": str(e)}
+
+@mcp.tool()
+async def audit_oauth_oidc_endpoints(issuer_url: str) -> Dict[str, Any]:
+    """Audit OpenID Connect /.well-known/openid-configuration for PKCE (S256) and grant compliance."""
+    base = issuer_url.rstrip("/")
+    if not base.startswith(("http://", "https://")):
+        base = "https://" + base
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as c:
+            r = await c.get(f"{base}/.well-known/openid-configuration")
+            if r.status_code == 200:
+                cfg = r.json()
+                pkce = cfg.get("code_challenge_methods_supported", [])
+                return {"issuer": cfg.get("issuer"), "pkce_methods": pkce, "supports_s256": "S256" in pkce}
+            return {"issuer": base, "status_code": r.status_code, "found": False}
+    except Exception as e:
+        return {"error": str(e)}
+
+@mcp.tool()
 async def hexstrike_backend_relay(tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Relay to HexStrike core engine (https://github.com/0x4m4/hexstrike-ai) with fallback simulation."""
     try:
@@ -589,7 +705,7 @@ async def root(request: Request):
         "service": "HexStrike AI FastMCP Server",
         "sse_endpoint": "/sse",
         "health": "/health",
-        "tools_active": 23,
+        "tools_active": 31,
         "tools": [
             "inspect_binary_headers",
             "disassemble_machine_code",
@@ -613,6 +729,14 @@ async def root(request: Request):
             "analyze_web_tech_stack",
             "audit_subdomain_takeover_cnames",
             "deobfuscate_javascript_snippet",
+            "identify_hash_algorithm",
+            "audit_directory_listing_and_sensitive_paths",
+            "audit_graphql_introspection",
+            "audit_xml_xxe_vectors",
+            "audit_content_security_type_sniffing",
+            "audit_rate_limiting_headers",
+            "inspect_ip_address_reputation_and_asn",
+            "audit_oauth_oidc_endpoints",
             "hexstrike_backend_relay"
         ],
     })
