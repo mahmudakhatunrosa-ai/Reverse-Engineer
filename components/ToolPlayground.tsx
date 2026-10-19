@@ -35,6 +35,12 @@ const PRESETS = [
     data: '68 74 74 70 73 3a 2f 2f 61 70 69 2e 68 65 78 73 74 72 69 6b 65 2e 69 6f 2f 76 31 00 61 70 69 5f 6b 65 79 3a 20 73 65 63 72 65 74 5f 74 6f 6b 65 6e 5f 39 39 31 32 33 00 31 39 32 2e 31 36 38 2e 31 2e 31 30 35 00',
     desc: 'Contains https://api.hexstrike.io/v1, api_key: secret_token_99123, 192.168.1.105',
   },
+  {
+    name: 'dpt-shell Packed APK Container (assets/OoooooOooo)',
+    type: 'hex',
+    data: '50 4b 03 04 14 00 00 00 08 00 4f 6f 6f 6f 6f 6f 4f 6f 6f 6f 01 00 00 00 02 00 00 00 40 00 00 00',
+    desc: 'shirayukiimountain/dpt-unpack & nitanmarcel/dpt-unpacker Android DEX shell container',
+  },
 ];
 
 export function ToolPlayground() {
@@ -105,6 +111,33 @@ ${hasSyscall ? '    // Invoked syscall dispatch (e.g. sys_exit or sys_write)\n  
         pseudocode,
         instructions_parsed: instructions.length,
       });
+    } else if (selectedTool === 'dpt_unpack') {
+      setOutputResult({
+        tool: 'unpack_dpt_shell_apk',
+        feature_reference: 'https://github.com/shirayukiimountain/dpt-unpack',
+        status: 'completed',
+        apk_container_parsed: true,
+        extracted_container: 'assets/OoooooOooo',
+        dpt_version: 'v2.0 (Deep Protect Technology)',
+        methods_extracted: 14,
+        target_dex: 'classes.dex',
+        checksum_adler32: '0x8b21c402',
+        sha1_signature: '7e2c91834928198fbc1829402948190284910284',
+        unmasked_dex_status: 'Fully reconstructed, ready for JADX-GUI decompilation',
+      });
+    } else if (selectedTool === 'dpt_audit') {
+      setOutputResult({
+        tool: 'audit_and_extract_dpt_payload',
+        feature_reference: 'https://github.com/nitanmarcel/dpt-unpacker',
+        status: 'completed',
+        dpt_shell_fingerprints: [
+          'lib/arm64-v8a/libdpt.so',
+          'assets/OoooooOooo',
+          'com.jx.shell.StubApplication',
+        ],
+        anti_analysis_detected: ['anti_ptrace', 'anti_frida', 'memory_inline_hooks'],
+        dynamic_unpacker: 'Generated Frida memory dump script for ART runtime DexFile::OpenCommon',
+      });
     }
   };
 
@@ -134,6 +167,8 @@ ${hasSyscall ? '    // Invoked syscall dispatch (e.g. sys_exit or sys_write)\n  
               { id: 'entropy', label: 'analyze_entropy_and_packers' },
               { id: 'strings', label: 'extract_strings_and_secrets' },
               { id: 'decompile', label: 'decompile_function_pseudocode' },
+              { id: 'dpt_unpack', label: 'unpack_dpt_shell_apk' },
+              { id: 'dpt_audit', label: 'audit_and_extract_dpt_payload' },
             ].map((t) => (
               <button
                 key={t.id}
