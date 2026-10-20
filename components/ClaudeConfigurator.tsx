@@ -215,6 +215,21 @@ export function ClaudeConfigurator() {
               prompt:
                 'Extract all strings, suspicious IPs, and potential hardcoded credentials from this binary using extract_strings_and_secrets.',
             },
+            {
+              title: 'Website Cloner & UI Reverse Engineering (morluto/rea)',
+              prompt:
+                'Use clone_website_frontend to clone the UI and DOM of https://example.com, extract design tokens, CSS styles, and discover backend API endpoints.',
+            },
+            {
+              title: 'Reconstruct Frontend Source Maps (morluto/rea)',
+              prompt:
+                'Inspect this JavaScript bundle with reconstruct_frontend_source_maps to recover original React component file paths, imports, and routes.',
+            },
+            {
+              title: 'Unpack dpt-shell Android APK (DPT-Unpack)',
+              prompt:
+                'Unpack this protected Android APK container with unpack_dpt_shell_apk and patch classes.dex code items.',
+            },
           ].map((item, i) => (
             <div key={i} className="rounded-lg border border-neutral-800 bg-neutral-950 p-3.5 space-y-2">
               <span className="text-xs font-semibold text-emerald-400">{item.title}</span>
