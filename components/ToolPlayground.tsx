@@ -53,6 +53,12 @@ const PRESETS = [
     data: 'function App(){return React.createElement("div",null,"HexStrike");} //# sourceMappingURL=main.chunk.js.map',
     desc: 'morluto/rea frontend sourcemap reconstructor bundle snippet',
   },
+  {
+    name: 'Google Maps Scraper (Dental Clinics, Austin TX)',
+    type: 'query',
+    data: 'Dental Clinics in Austin, TX',
+    desc: 'Mahanaicoach/google-maps-scraper-kit keyless lead extractor & email crawler',
+  },
 ];
 
 export function ToolPlayground() {
@@ -132,6 +138,40 @@ export function ToolPlayground() {
         ],
         extracted_components: ['Navbar', 'Hero', 'FeatureGrid', 'UserProfile', 'AuthModal'],
         detected_npm_packages: ['react', 'react-dom', 'axios', 'lucide-react', 'clsx'],
+      });
+      return;
+    } else if (selectedTool === 'gmaps_scraper') {
+      setOutputResult({
+        tool: 'scrape_google_maps_leads',
+        feature_reference: 'https://github.com/Mahanaicoach/google-maps-scraper-kit',
+        status: 'completed',
+        target_query: inputData || 'Dental Clinics in Austin, TX',
+        total_leads_extracted: 12,
+        enrichment_status: 'Crawl completed (Emails & Social Links extracted)',
+        leads_sample: [
+          {
+            name: 'Apex Dental Care',
+            category: 'Dental Clinic',
+            phone: '512-492-8192',
+            website: 'https://www.apexdentalcare.com',
+            emails: ['contact@apexdentalcare.com', 'info@apexdentalcare.com'],
+            social: { linkedin: 'https://linkedin.com/company/apexdentalcare' },
+            rating: 4.9,
+            reviews: 142,
+            pipeline_status: 'New',
+          },
+          {
+            name: 'Lumina Smile Studio',
+            category: 'Cosmetic Dentist',
+            phone: '512-381-9012',
+            website: 'https://www.luminasmilestudio.com',
+            emails: ['hello@luminasmilestudio.com'],
+            rating: 4.8,
+            reviews: 98,
+            pipeline_status: 'Qualified',
+          },
+        ],
+        export_formats_supported: ['RFC 4180 CSV', 'JSON', 'FastMCP Protocol Stream'],
       });
       return;
     }
@@ -252,6 +292,7 @@ ${hasSyscall ? '    // Invoked syscall dispatch (e.g. sys_exit or sys_write)\n  
               { id: 'dpt_audit', label: 'audit_and_extract_dpt_payload' },
               { id: 'clone_website', label: 'clone_website_frontend (morluto/rea)' },
               { id: 'rea_sourcemap', label: 'reconstruct_frontend_source_maps' },
+              { id: 'gmaps_scraper', label: 'scrape_google_maps_leads (gmaps-kit)' },
             ].map((t) => (
               <button
                 key={t.id}

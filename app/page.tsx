@@ -9,6 +9,7 @@ import { CodebaseExplorer } from '@/components/CodebaseExplorer';
 import { LivePingTester } from '@/components/LivePingTester';
 import { SERVER_FILES } from '@/lib/server-files';
 import JSZip from 'jszip';
+import { GoogleMapsScraper } from '@/components/GoogleMapsScraper';
 import {
   Shield,
   Server,
@@ -22,10 +23,11 @@ import {
   Layers,
   Code,
   Globe,
+  MapPin,
 } from 'lucide-react';
 
 export default function Home() {
-  const [activeTab, setActiveTab] = useState('render');
+  const [activeTab, setActiveTab] = useState('maps-scraper');
   const [isDownloadingZip, setIsDownloadingZip] = useState(false);
 
   const handleDownloadZip = async () => {
@@ -72,26 +74,34 @@ export default function Home() {
                 <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
                 <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
               </span>
-              <span>FastMCP Protocol · 24/7 Render Web Service Ready</span>
+              <span>FastMCP Protocol · Google Maps Scraper Kit · 24/7 Render Service</span>
             </div>
 
             <h1 className="text-3xl sm:text-5xl font-extrabold tracking-tight text-white leading-tight">
-              HexStrike AI <span className="text-emerald-400 font-mono">FastMCP Server</span>
+              HexStrike AI <span className="text-emerald-400 font-mono">FastMCP & Maps Scraper</span>
             </h1>
 
             <p className="text-base sm:text-lg text-neutral-300 leading-relaxed max-w-2xl">
-              Turn <span className="font-semibold text-white">0x4m4/hexstrike-ai</span> into a remote 24/7 Model Context Protocol (MCP) server. 
-              Empower Claude Desktop, Claude Web, Cursor, and Windsurf to autonomously disassemble binaries, detect packers, decompile pseudocode, and audit security mitigations.
+              Turn <span className="font-semibold text-white">HexStrike AI</span> into an offensive security, reverse engineering, and automated Google Maps business lead intelligence suite. Extract keyless leads, crawl websites for public verified emails, and integrate directly with Claude, Cursor, and Windsurf via FastMCP.
             </p>
 
             {/* CTAs */}
             <div className="flex flex-wrap items-center gap-3 pt-2">
               <button
-                onClick={() => setActiveTab('render')}
+                onClick={() => setActiveTab('maps-scraper')}
                 className="flex items-center gap-2 rounded-lg bg-emerald-500 hover:bg-emerald-400 px-5 py-2.5 text-sm font-semibold text-neutral-950 transition-all shadow-lg shadow-emerald-500/20"
               >
-                <span>Render 24/7 Setup Guide</span>
+                <MapPin className="h-4 w-4" />
+                <span>Google Maps Scraper</span>
                 <ArrowRight className="h-4 w-4" />
+              </button>
+
+              <button
+                onClick={() => setActiveTab('render')}
+                className="flex items-center gap-2 rounded-lg border border-neutral-700 hover:border-neutral-600 bg-neutral-900 px-5 py-2.5 text-sm font-semibold text-white transition-colors"
+              >
+                <Server className="h-4 w-4 text-emerald-400" />
+                <span>Render 24/7 Setup</span>
               </button>
 
               <button
@@ -124,8 +134,8 @@ export default function Home() {
               <p className="font-semibold text-emerald-400">HTTP + SSE (/sse)</p>
             </div>
             <div className="space-y-0.5">
-              <span className="text-neutral-500">Hosting</span>
-              <p className="font-semibold text-white">Render (24/7 Web Service)</p>
+              <span className="text-neutral-500">Lead Extraction</span>
+              <p className="font-semibold text-white">Google Maps + Email Crawler</p>
             </div>
             <div className="space-y-0.5">
               <span className="text-neutral-500">Target AI Clients</span>
@@ -136,6 +146,7 @@ export default function Home() {
 
         {/* Dynamic Tab Contents */}
         <section className="space-y-6">
+          {activeTab === 'maps-scraper' && <GoogleMapsScraper />}
           {activeTab === 'render' && <RenderSetupGuide />}
           {activeTab === 'claude' && <ClaudeConfigurator />}
           {activeTab === 'playground' && <ToolPlayground />}
@@ -152,6 +163,12 @@ export default function Home() {
             <span>HexStrike AI FastMCP Server · Compatible with 0x4m4/hexstrike-ai</span>
           </div>
           <div className="flex items-center gap-4">
+            <button
+              onClick={() => setActiveTab('maps-scraper')}
+              className="text-emerald-400 hover:text-emerald-300 font-medium transition-colors"
+            >
+              Google Maps Scraper
+            </button>
             <button
               onClick={() => setActiveTab('render')}
               className="hover:text-neutral-300 transition-colors"

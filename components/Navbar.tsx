@@ -12,6 +12,7 @@ interface NavbarProps {
 
 export function Navbar({ activeTab, setActiveTab, onDownloadZip, isDownloadingZip }: NavbarProps) {
   const navItems = [
+    { id: 'maps-scraper', label: 'Google Maps Scraper' },
     { id: 'render', label: 'Render 24/7 Setup' },
     { id: 'claude', label: 'Claude MCP Config' },
     { id: 'playground', label: 'Live Tool Tester' },
