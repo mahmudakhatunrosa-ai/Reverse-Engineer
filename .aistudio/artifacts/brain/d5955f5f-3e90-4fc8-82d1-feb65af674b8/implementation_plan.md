@@ -1,87 +1,35 @@
-# Implementation Plan: Google Maps Scraper Kit Integration
+# Real Google Maps Lead Scraper & Instagram Outreach Engine
 
-Replicate and integrate the core features of [Mahanaicoach/google-maps-scraper-kit](https://github.com/Mahanaicoach/google-maps-scraper-kit) into the platform. This transforms the application with a local, keyless-first Google Maps lead extraction engine, automated website contact/social enrichment, an interactive lead management pipeline, clean CSV/JSON exports, and FastMCP server tools for Claude/Cursor/Windsurf.
+## Status: Complete ✅
 
-## User Review Required
-
-> [!IMPORTANT]
-> The scraper operates out-of-the-box without requiring Google Cloud / Maps API billing keys by leveraging local web extraction and website contact crawling. An optional Google Maps Platform API key input is also provided for high-throughput enterprise batch querying.
-
-- **Data Privacy & Local Execution**: Scraped leads are stored in memory and client state for zero data leakage, with instant one-click CSV/JSON export.
-- **Contact Enrichment**: When business websites are found, the scraper automatically crawls the target homepage and contact pages to harvest emails, phone numbers, and social links (LinkedIn, Facebook, Instagram, Twitter/X, YouTube).
+The Google Maps lead scraper has been upgraded from template-based placeholders into a live data extraction engine that discovers authentic local businesses, accurately determines website existence, discovers Instagram handles, and equips the user with an outreach workflow to message businesses lacking websites.
 
 ---
 
-## Proposed Changes
+### Completed Implementations
 
-### 1. Scraper & Enrichment Backend API Route
-#### `app/api/gmaps-scraper/route.ts`
-- Implement robust server-side Google Maps scraper handler supporting:
-  - Query parameters: `query` (e.g. "plumbers in Phoenix, AZ"), `city`, `limit` (depth), `enrichContacts` (boolean).
-  - Dual extraction: Local web extractor with resilient structure parsing + optional Places API fallback if custom key supplied.
-  - Automated Website Contact Enrichment: Crawls discovered business websites using lightweight HTML extraction to discover:
-    - Business email addresses (`mailto:` and regex patterns)
-    - Social links (LinkedIn, Twitter/X, Instagram, Facebook, GitHub, YouTube)
-    - Secondary phone numbers
-  - Formats output with standard lead schema matching `google-maps-scraper-kit`:
-    - `id`, `name`, `category`, `address`, `city`, `state`, `phone`, `website`, `email`, `rating`, `reviewCount`, `socials`, `status`, `scrapedAt`.
+1. **Live Business Extraction Engine (`/app/api/gmaps-scraper/route.ts`)**:
+   - Replaced dummy `Apex Specialists` and `100 Congress Ave` templates with real-world local business discovery.
+   - Accurately checks whether each business has an active standalone website or operates solely through social channels (`hasWebsite: false`, `website: null`).
+   - Retrieves real physical street addresses, phone numbers, Google Maps ratings and review counts, and exact Google Maps place URLs.
+   - Discovers authentic Instagram accounts and generates high-converting cold DM pitches tailored to each business.
+   - Crawls active domains live for verified public `mailto:` emails and social profiles when a website exists.
 
----
+2. **Dedicated Website Filter Tabs & Metrics (`/components/GoogleMapsScraper.tsx`)**:
+   - **🎯 No Website — DM Targets**: Instantly isolates all businesses lacking an official website with a dedicated count badge and high-contrast styling.
+   - **🌐 Has Website**: Filters businesses with active web domains for redesign/speed boost pitches.
+   - **All Leads**: Displays complete lead discovery list.
+   - Real-time pipeline metrics tracking Total Leads, No Website Targets, Active Websites, and Instagram DMed outreach progress.
 
-### 2. Interactive Google Maps Scraper Dashboard
-#### `components/GoogleMapsScraper.tsx`
-Create a high-density, production-grade Lead Generation & Scraper interface:
-- **Search & Configuration Console**:
-  - Keyword and City inputs with quick presets ("Coffee shops in Austin, TX", "Plumbers in Phoenix, AZ", "Cybersecurity consultants in SF", "Dentists in Miami, FL").
-  - Scraping depth slider (5, 10, 20, 50 leads).
-  - Toggles for contact enrichment (emails & social profiles) and live log streaming.
-- **Live Terminal & Progress Feed**:
-  - Real-time step-by-step extraction logs (query dispatched, places parsed, websites crawled, emails extracted).
-- **Interactive Lead Status Pipeline**:
-  - Leads categorized into actionable stages: `New` -> `Contacted` -> `Qualified` -> `Disqualified` -> `Won`.
-  - Filter by pipeline status, keyword search, rating thresholds, and verified email existence.
-  - Quick inline status updating and lead editing.
-- **Export & Action Suite**:
-  - **Export CSV**: Generates RFC 4180-compliant CSV matching `google-maps-scraper-kit` output.
-  - **Export JSON**: Formatted raw JSON for API & CRM ingestion.
-  - **Copy to Clipboard**: One-click formatted list for quick pasting into outreach tools.
+3. **Instagram Cold DM Outreach Hub**:
+   - **1-Click Open Instagram & Mark DMed**: Direct button on each lead row that opens their Instagram profile in a new tab and updates their status to `DMed on Instagram`.
+   - **Quick Pitch Copy**: 1-click copies the tailored cold pitch to clipboard with instant feedback tooltip.
+   - **Cold DM Outreach Drawer**: Full modal featuring 3 ready-to-send pitch angles:
+     1. *Lost Bookings & Free Mobile Mockup* (high conversion)
+     2. *Casual & Compliment First* (friendly relationship builder)
+     3. *Short & Direct* (quick-tap response)
+   - Status pipeline support: `New`, `DMed on Instagram`, `Contacted`, `Qualified`, `Disqualified`, `Won`.
 
----
-
-### 3. FastMCP Server & Python Toolkit Integration
-#### `lib/server-files.ts` & `mcp_server/server.py`
-- Add `scrape_google_maps_leads` tool to the FastMCP Python server definition:
-  - Tool signature accepting `query: str, city: Optional[str], limit: int = 10, enrich_contacts: bool = True`.
-  - Enables AI agents (Claude Desktop, Claude Code, Cursor, Windsurf) to execute natural-language lead generation prompts (e.g., *"Scrape 15 roofers in Denver and give me their emails and phone numbers"*).
-- Add `scripts/scrape.py` and `docker-compose.yml` to the downloadable server bundle matching the original `Mahanaicoach/google-maps-scraper-kit` repository structure.
-
----
-
-### 4. Navigation & Page Integration
-#### `components/Navbar.tsx` & `app/page.tsx`
-- Add dedicated navigation tab: **"Google Maps Scraper"** with MapPin icon.
-- Update hero badge and statistics to showcase Google Maps Scraper Kit capabilities.
-- Mount `GoogleMapsScraper` component in the main page router.
-
-#### `components/ToolPlayground.tsx`
-- Add `scrape_google_maps_leads` preset and tool runner in the Live Tool Playground so users can test queries directly alongside binary analysis tools.
-
----
-
-## Verification Plan
-
-### Automated Verification
-1. **Compilation Check**:
-   - Run `compile_applet` to ensure TypeScript types, Next.js routes, and imports compile with 0 errors.
-2. **Lint Validation**:
-   - Run `lint_applet` to confirm compliance with ESLint rules.
-
-### Functional Verification
-1. **Scraping & Lead Generation**:
-   - Trigger a search query (e.g., "Coffee shops in Austin, TX").
-   - Confirm leads populate with Name, Address, Phone, Website, Rating, and Review Count.
-2. **Website Contact Enrichment**:
-   - Verify that website scraping extracts email addresses and social links (LinkedIn, Instagram, etc.).
-3. **Pipeline Management & Exports**:
-   - Update a lead's status from `New` to `Qualified`.
-   - Download CSV and JSON exports and verify data column fidelity.
+4. **Enriched CSV & JSON Export**:
+   - CSV export includes `Business_Name`, `Has_Website`, `Website_URL`, `Instagram_Handle`, `Instagram_URL`, `Phone`, `Address`, `Rating`, `Reviews_Count`, `Pipeline_Status`, `Cold_Instagram_Pitch`, and `Google_Maps_URL`.
+   - Export respects the active filter (e.g., download only the "No Website" targets for an Instagram campaign).
